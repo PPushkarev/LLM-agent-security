@@ -1,0 +1,30 @@
+name: "Feature or integration / Функция или интеграция"
+description: "Suggest a capability or describe a harness integration gap. EN / RU."
+title: "[Idea]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        English or Russian is welcome. Describe the workflow; remove confidential data.
+        Можно писать на русском. Опишите сценарий без конфиденциальных данных.
+  - type: textarea
+    id: problem
+    attributes:
+      label: "Problem and workflow / Задача и сценарий"
+      description: "What are you trying to do? / Что вы хотите сделать?"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: "Platform and harness / Платформа и harness"
+  - type: textarea
+    id: proposal
+    attributes:
+      label: "Proposed behavior / Предлагаемое поведение"
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: "Alternatives and context / Альтернативы и контекст"
