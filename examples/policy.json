@@ -1,0 +1,72 @@
+{
+  "workspace": "./examples/ws",
+  "writable": [],
+  "read_deny": [
+    "~/.ssh",
+    "~/.aws",
+    "~/.config/gh",
+    "~/.codex",
+    "~/.claude",
+    "~/.hermes",
+    "~/Library/Keychains"
+  ],
+  "self_protect": [
+    ".git/hooks",
+    ".git/config",
+    ".envrc",
+    ".claude",
+    ".vscode",
+    "package.json"
+  ],
+  "allow_domains": [
+    "api.anthropic.com",
+    "registry.npmjs.org"
+  ],
+  "env_allow": [
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "TMPDIR"
+  ],
+  "exec": {
+    "deny": [
+      "/usr/bin/osascript",
+      "/usr/bin/security",
+      "/usr/bin/ssh",
+      "/usr/bin/nc",
+      "/usr/bin/sudo"
+    ],
+    "allow": []
+  },
+  "proxy_port": 0,
+  "key_injection": [
+    {
+      "prefix": "/anthropic",
+      "upstream": "https://api.anthropic.com",
+      "header": "x-api-key",
+      "env": "ANTHROPIC_API_KEY",
+      "methods": ["POST"],
+      "allow_paths": ["/v1/messages"]
+    }
+  ],
+  "prompt_filter": {
+    "enabled": true,
+    "mode": "enforce",
+    "max_body_bytes": 1048576,
+    "block": [
+      { "name": "slack_token", "pattern": "xox[baprs]-[0-9A-Za-z-]{10,}" }
+    ],
+    "redact": [
+      { "name": "email", "pattern": "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}", "action": "flag" },
+      { "name": "bearer_token", "pattern": "(?i)bearer\\s+[A-Za-z0-9._-]{8,}", "action": "redact" }
+    ],
+    "literal_redact": [],
+    "scan_responses": true,
+    "response_block": [
+      { "name": "prompt_injection", "pattern": "(?i)ignore (all )?(your )?previous instructions" }
+    ],
+    "audit_log": "./examples/guard-audit.log"
+  },
+  "limits": {
+    "max_requests": 500,
+    "rate_per_min": 60,
+    "max_request_bytes": 50000000
+  }
+}

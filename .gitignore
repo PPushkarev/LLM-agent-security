@@ -1,0 +1,11 @@
+# Скомпилированный бинарь guard
+/guard
+
+# Тестовые артефакты (создаются стендами на лету)
+examples/ws/
+examples/*-audit.log
+examples/guard-audit.log
+
+# Прочее
+*.sb
+.DS_Store
