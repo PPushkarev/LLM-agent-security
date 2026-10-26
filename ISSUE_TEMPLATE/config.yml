@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "Enterprise demo or pilot / Демо или пилот"
+    url: https://spaceai.ru/form/
+    about: "Discuss an enterprise workflow with SpaceAI / Обсудить корпоративный сценарий со SpaceAI"
+  - name: "Integration or partnership / Интеграция или партнёрство"
+    url: https://t.me/ran111s
+    about: "Contact the founder / Связаться с основателем"
+  - name: "Private vulnerability report / Закрытое сообщение об уязвимости"
+    url: https://github.com/SpaceAI-UAG/LLM-agent-security/blob/main/SECURITY.md
+    about: "Read the private reporting instructions / Инструкция по закрытому сообщению"

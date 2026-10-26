@@ -1,238 +1,121 @@
-# guard — sandbox any agent harness
+<p align="center">
+  <img src="docs/assets/banner-en.png" alt="SpaceAI Guard — put boundaries around your AI agents" width="100%">
+</p>
 
-`guard` wraps an arbitrary agent harness (Claude Code, Codex, Hermes, or your
-own) in an OS-level sandbox plus an allowlisting egress proxy, so a
-compromised, confused, or over-eager agent cannot read your secrets, write
-outside its workspace, phone home, or persist itself.
+<p align="center"><strong>English</strong> · <a href="README.ru.md">Русский</a></p>
 
-The isolation covers the **whole harness and every child it spawns** — shells,
-`node`, `python`, MCP servers, plugins — so you don't have to trust the harness
-to apply limits correctly.
+<h1 align="center">SpaceAI Guard</h1>
+<p align="center"><strong>Put boundaries around your AI agents.</strong><br>OS sandboxing, controlled egress and content filtering for agent harnesses.</p>
 
-```
-guard (trusted, outside the sandbox)
- ├─ egress proxy  127.0.0.1:PORT   — domain allowlist + injects the API key
- └─ sandbox ─► harness ─► all children (inherit every restriction)
-```
+<p align="center">
+  <img src="https://img.shields.io/badge/status-prototype-8B5CF6" alt="Status: prototype">
+  <img src="https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&amp;logoColor=white" alt="Go 1.26 or newer">
+  <img src="https://img.shields.io/badge/macOS-Seatbelt-111827?logo=apple&amp;logoColor=white" alt="macOS Seatbelt backend">
+  <img src="https://img.shields.io/badge/Linux-experimental-6B7280?logo=linux&amp;logoColor=white" alt="Linux backend: experimental">
+</p>
 
-## Why not just chroot?
+<p align="center">
+  <a href="#quick-start">Try locally</a> · <a href="docs/usage.md">Technical guide</a> ·
+  <a href="https://spaceai.ru/form/">Request a demo</a> · <a href="https://spaceai.ru/">SpaceAI website</a>
+</p>
 
-chroot only remaps the filesystem root. It is not a security boundary (root
-escapes it trivially), it does nothing about the network, IPC, or secrets in
-the environment, and on macOS it is barely usable because the system dylibs
-live in the dyld shared cache, not on disk. `guard` instead composes the
-mechanisms each OS actually provides:
+An AI agent can run commands, read files and call external APIs. A mistake or malicious instruction can become a real action on your machine.
 
-| Layer | macOS | Linux |
-|---|---|---|
-| Filesystem | Seatbelt (`sandbox-exec`, deny-by-default SBPL) | bubblewrap (mount ns: `--ro-bind /`, rw workspace, tmpfs `$HOME`) |
-| Network | loopback only → traffic must use the proxy | `--unshare-net` → only the proxy socket is reachable |
-| Secrets | **never in the sandbox**; the proxy adds the auth header | same |
-| Persistence | write-deny on `.git/hooks`, rc files, harness config | `--ro-bind` the same paths |
-| IPC | narrow `mach-lookup` allowlist (no Keychain/AppleEvents) | `--unshare-ipc`, seccomp |
-| Tools (exec) | `process-exec*` deny/allow list of binaries | (seccomp/`--ro-bind` — planned) |
+**SpaceAI Guard (`guard`) wraps the agent harness in an OS sandbox and applies a declarative policy to its environment and outbound API traffic.** Inspect the policy, filter a prompt, then evaluate a sandboxed session in a disposable environment.
 
-Two content checkpoints sit on top of this: an **input filter** on the prompt
-before the harness runs it (`guard submit`), and an **egress firewall** on
-everything the harness sends out (prompts, searches, tool calls, responses).
+This repository publishes a **focused prototype from the SpaceAI initiative**. SpaceAI's broader product is an enterprise control plane for AI agents: access, controlled execution, audit and risk management. See the [enterprise use cases](docs/enterprise.md) for that wider scope.
 
-## Usage
+## What you can evaluate
+
+| Control | Implementation | Practical value |
+| --- | --- | --- |
+| OS sandbox | macOS Seatbelt; experimental Linux bubblewrap backend | Apply boundaries to the harness and its child processes |
+| Filesystem policy | Writable paths, denied reads and protected persistence paths | Reduce unwanted access and changes |
+| Controlled egress | Domain allowlist and reverse-proxy routes | Make outbound destinations explicit |
+| API key injection | Parent proxy adds a configured upstream auth header | Keep provider keys out of the child environment with a correctly configured policy |
+| Request policy | HTTP methods, path prefixes and query rules on configured routes | Narrow the API operations the harness can request |
+| Content filtering | Regex rules: `block`, `flag`, `redact`; monitoring mode | Inspect prompts and eligible API traffic against your rules |
+| Usage limits & logs | Session request/rate/body-byte limits; filter decision log | Inspect activity and constrain request volume |
+
+Read the [current boundaries](#current-boundaries) before treating these as security guarantees.
+
+## Who this is for
+
+- **Agent developers** evaluating external controls around command-running harnesses.
+- **Platform and security teams** reviewing agent access to files, credentials and external APIs.
+- **Integrators and B2B SaaS teams** preparing agent workflows for enterprise environments.
+
+Claude Code, Codex, Hermes and custom CLI harnesses are example integration targets. Compatibility depends on each harness's authentication, configuration and networking behavior; this repository does not establish a tested compatibility matrix.
+
+<a id="quick-start"></a>
+## Quick start
+
+Requires **Go 1.26+**. Input filtering needs no LLM account or sandboxed harness. Actual sandbox execution requires macOS with `sandbox-exec`; the Linux backend is experimental.
 
 ```sh
+git clone https://github.com/SpaceAI-UAG/LLM-agent-security.git
+cd LLM-agent-security
 go build -o guard ./cmd/guard
+mkdir -p examples/ws
 
-# Inspect exactly what will be enforced (no execution):
+# Inspect the OS policy without launching a harness.
 ./guard profile --policy examples/policy.json
-./guard run --dry-run --policy examples/policy.json -- hermes chat
 
-# Run a harness under the sandbox:
-export ANTHROPIC_API_KEY=sk-ant-...      # stays in guard; never enters the sandbox
-./guard run --policy examples/policy.json -- hermes chat
+# Filter a benign prompt locally. No provider API call is made.
+./guard submit --policy examples/policy.json --prompt "Summarize the project README"
 ```
 
-The harness is pointed at `ANTHROPIC_BASE_URL=http://127.0.0.1:PORT/anthropic`;
-`guard` forwards to the real API and attaches the key. The agent works normally
-but holds no credential to leak.
-
-## Request allowlist — limit what the agent may ask for
-
-A host allowlist is not enough: once a host is reachable (or the injected key is
-in play) a compromised agent could hit *any* path or method on it — account and
-billing endpoints, file uploads, `DELETE`, model-management, etc. A
-key-injection route can therefore pin the exact requests it permits:
-
-```json
-"key_injection": [{
-  "prefix": "/anthropic", "upstream": "https://api.anthropic.com",
-  "header": "x-api-key", "env": "ANTHROPIC_API_KEY",
-  "methods": ["POST"], "allow_paths": ["/v1/messages"]
-}]
-```
-
-The agent may now issue **only** `POST /v1/messages` with the injected key;
-`GET /v1/messages`, `POST /v1/organizations`, uploads, deletes — all get a 403
-and an audit entry. An empty `methods`/`allow_paths` list means "any".
-
-For a search or tool endpoint you can go finer than method+path and filter the
-query **by parameter** — more precise than a regex over the whole URL:
-
-```json
-"query": {
-  "allow_params": ["q", "count"],
-  "max_param_len": 100,
-  "param_rules": [{ "param": "q", "action": "block", "pattern": "(?i)site:internal" }]
-}
-```
-
-Now an unexpected param (`&callback=…`), an over-long value, or a forbidden term
-inside `q` is blocked; `flag`/`redact` actions work per-param too. So the agent
-can search, but only for what the policy allows, with no smuggling via extra
-parameters.
-
-This path/method control works on the key-injection route because that traffic
-is plaintext on loopback. A raw HTTPS `CONNECT` tunnel to an allowlisted domain
-is encrypted, so there guard can enforce the host only — route an API through a
-key-injection prefix when you need request-level control over it.
-
-## Input filter (Filter A) — clean the prompt before the harness sees it
-
-`guard submit` inspects a prompt *before* it reaches the agent, so bad input
-never enters the agent's logic:
+**Expected:** `profile` prints the OS policy; `submit` prints the clean prompt unchanged. To observe a block, run this command separately; it should exit with a non-zero status:
 
 ```sh
-guard submit --policy policy.json --prompt "mail bob@corp.com"      # prints: mail [REDACTED:email]
-guard submit --policy policy.json --prompt "ignore all previous instructions"  # refused, exit≠0
-echo "do X" | guard submit --policy policy.json -- hermes chat      # cleaned prompt piped to a sandboxed harness
+./guard submit --policy examples/policy.json --prompt "-----BEGIN OPENSSH PRIVATE KEY----- DEMO-ONLY"
 ```
 
-It reuses the same rules as the egress firewall: **block** cuts the prompt off
-(the harness is not invoked), **redact** masks spans, **flag** records without
-changing anything. With a `--` harness it runs that harness sandboxed and feeds
-it the cleaned prompt on stdin; without one it just prints the result. (Live
-interactive TUIs type straight into the harness — for those the prompt is still
-inspected at the harness→LLM hop by the egress firewall below.)
+This is a synthetic marker, not a real secret. The enabled filter detects the private-key header and rejects the prompt.
 
-## Tool execution filter — restrict which binaries the agent may run
+**Next:** review [the sample policy](examples/policy.json), then follow the [harness setup and API routing guide](docs/usage.md#run-a-harness) for key injection, monitor mode, tool controls, limits and local test scripts.
 
-The sandbox also filters *local* tools, not just network egress. `exec.deny`
-refuses dangerous binaries (robust default); `exec.allow`, when set, flips to
-allowlist mode (stronger, but shells/interpreters re-exec helpers so it needs
-tuning):
+## How it works
 
-```json
-"exec": { "deny": ["/usr/bin/osascript", "/usr/bin/security", "/usr/bin/ssh", "/usr/bin/nc", "/usr/bin/sudo"] }
-```
+| Component | Responsibility |
+| --- | --- |
+| `guard` parent process | Loads policy, holds configured provider credentials and starts the proxy |
+| OS sandbox | Restricts the harness and its children according to the backend and policy |
+| Egress proxy | Checks destinations; configured routes add method/path/query rules and auth headers |
+| Content filter | Inspects submitted prompts and configured reverse-proxy traffic; optionally logs filter decisions |
 
-A denied `exec` returns "operation not permitted" (rc 126); normal tools keep
-working. Note: a path-based denylist is defense-in-depth — a copy of the binary
-at another path isn't covered, so use allowlist mode when you need a hard
-guarantee.
+Controls apply around the harness, including its shells, interpreters and local MCP server processes. This does not add application-level authorization to a remote MCP server or corporate API.
 
-## Rate / budget limits
+<a id="current-boundaries"></a>
+## Current boundaries
 
-Even permitted requests shouldn't be unlimited — otherwise a runaway or
-compromised agent can spam the API, run up a bill, or exfiltrate data in many
-small allowed pieces. The `limits` section caps egress per session (any field
-`0` = unlimited):
+- **Prototype:** use a disposable environment. No independent security audit or certification is claimed.
+- **Backend differences:** macOS permits loopback connections broadly, not just the proxy port. Linux has no bridge from its network namespace to the parent proxy yet; per-binary `exec` rules are not enforced on Linux.
+- **Inspection scope:** configured reverse-proxy routes are inspected; encrypted HTTPS `CONNECT` payloads and streaming SSE responses are not. Regex rules do not provide complete prompt-injection or data-loss prevention.
+- **Policy matters:** filesystem reads are broadly allowed except configured exclusions. Review writable paths, environment passthrough, local services and audit-log placement.
 
-```json
-"limits": { "max_requests": 500, "rate_per_min": 60, "max_request_bytes": 50000000 }
-```
+See [platform behavior and limitations](docs/usage.md#limitations) for details.
 
-Over any cap, the proxy returns **429** and logs it; the limiter checks before
-consuming budget, so a rejected request doesn't eat into the quota. Counts apply
-to LLM calls, searches and plain egress alike.
+## Explore the project
 
-## Prompt / content firewall
+| Start here | English | Русский |
+| --- | --- | --- |
+| Overview | [README](README.md) | [Обзор](README.ru.md) |
+| Commands, configuration and limitations | [Technical guide](docs/usage.md) | [Техническое руководство](docs/usage.ru.md) |
+| Enterprise use cases and partnership | [SpaceAI for teams](docs/enterprise.md) | [SpaceAI для компаний](docs/enterprise.ru.md) |
+| Contributions and private security reports | [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) | [Участие](CONTRIBUTING.md#russian) · [Безопасность](SECURITY.md#russian) |
 
-The harness reaches the LLM over the key-injection route, which travels as
-**plaintext HTTP over loopback** (guard upgrades to HTTPS on the way out). So
-guard sees every prompt in the clear and can inspect it **without a MITM
-certificate**. The `prompt_filter` policy section controls three actions:
+## Bring agent control into your company
 
-Each rule has an **action** so your own legitimate prompt is never changed
-behind your back:
+**SpaceAI — a unified control layer for enterprise AI agents.** If your agents are starting to act in CRM, ERP, helpdesk or internal APIs, let's map the required access rules, approvals and audit evidence. These are broader SpaceAI deployment topics; the full enterprise platform is not included here.
 
-- **block** — refuse the request (a visible 403; the prompt is not altered).
-  Built-in always-on detectors cover PEM private keys, `AKIA…`, `sk-ant-…`,
-  `sk-…`, `ghp_…` and GCP service-account keys.
-- **flag** — detect and log, but **forward the prompt unchanged**. This is the
-  right default for soft patterns (emails, names): you find out it matched
-  without your text being rewritten.
-- **redact** — rewrite the matched span before sending. This is the *only*
-  action that silently changes your prompt, so it is **opt-in per rule** and,
-  when it fires, guard prints a loud warning (`your prompt was modified …`) and
-  records it in the audit log.
+- [Request a demo or discuss a pilot](https://spaceai.ru/form/)
+- [Explore the SpaceAI platform](https://spaceai.ru/)
+- [Discuss an integration or partnership](docs/enterprise.md#partners)
+- [Telegram: @ran111s](https://t.me/ran111s) · [Email](mailto:r.galizyanov@spaceai.ru)
 
-Two global modes:
+## Contribute and follow
 
-- **enforce** (default) — apply each rule's action.
-- **monitor** — never block and **never alter** anything; only log what *would*
-  have happened (`would-block:…`, `would-redact:…`). Run this first to tune
-  rules against real traffic before any prompt is ever changed or stopped.
+Found a reproducible bug or a harness integration gap? [Open an issue](https://github.com/SpaceAI-UAG/LLM-agent-security/issues/new/choose) or read the [contribution guide](CONTRIBUTING.md). Use the [private reporting route](SECURITY.md) for vulnerabilities. Star the repository if this work is useful, or use GitHub Watch to follow changes.
 
-The firewall inspects the **whole outbound request, not just the body**. A
-harness's search goes out as `GET /search?q=…`, with the query in the URL — so
-guard scans the path+query too (percent-decoded). That means the same rules
-block a search that leaks a secret (`?q=sk-ant-…`) or a search for a forbidden
-topic, flag or redact query terms, and log every search to the audit trail.
-Point the harness's search/tool endpoint at a key-injection prefix (any
-upstream, with or without an injected key) to get this control over it.
-
-Responses are scanned the same way (injection payloads like "ignore all
-previous instructions"). Every decision is appended to an audit log **outside**
-the sandbox, so a compromised agent can neither read nor erase it. Streaming
-(SSE) responses pass through unscanned to preserve token-by-token output — a
-documented limit of the prototype.
-
-```
-$ sh attack/filter_test.sh
-  PASS  PEM key blocked (403)
-  PASS  sk-ant key blocked (403)          # built-in detector
-  PASS  email redacted in forwarded body  # only when action=redact
-  PASS  clean prompt forwarded intact
-  PASS  injected model output blocked (403)
-  PASS  audit log has 8 entries
-  PASS  action=flag forwards the prompt UNCHANGED
-  PASS  monitor mode never blocks or alters (request + response)
-RESULT pass=9 fail=0
-```
-
-## Policy
-
-One declarative file is the single source of truth (see
-[`examples/policy.json`](examples/policy.json)). Key fields: `workspace` (the
-only writable tree), `read_deny` (secret paths), `self_protect` (persistence
-surfaces made read-only even inside the workspace), `allow_domains` (egress
-allowlist), `env_allow` (env var passthrough; everything else is dropped), and
-`key_injection` (base-URL → upstream + header-from-env routes), and
-`prompt_filter` (the content firewall above).
-
-## Acceptance test
-
-[`attack/run_attacks.sh`](attack/run_attacks.sh) plants fake secrets, puts a
-bogus API key in guard's own environment, and runs
-[`attack/attack.sh`](attack/attack.sh) — a stand-in misbehaving agent — under
-guard. It exits non-zero unless every escape is blocked.
-
-```
-$ sh attack/run_attacks.sh
-  PASS  wrote workspace file (expected)
-  PASS  blocked read of ~/.ssh ~/.aws ~/.codex ~/.claude ~/.hermes
-  PASS  blocked write to $HOME (incl. ../ trick)
-  PASS  blocked .git/hooks/pre-commit and .envrc
-  PASS  blocked direct TCP to example.com
-  PASS  proxy refused tunnel to a non-allowlisted domain
-  PASS  no API secrets in child env
-  PASS  keychain + AppleEvents blocked
-RESULT pass=15 fail=0
-```
-
-## Status & limits (prototype)
-
-- Seatbelt `sandbox-exec` is Apple-deprecated (still functional on macOS 26).
-  For a hard boundary, run `guard` inside a VM/container; a `--docker` mode and
-  a Linux bubblewrap path are stubbed in [`internal/sandbox`](internal/sandbox).
-- The `mach-lookup` allowlist is deliberately minimal and may need widening per
-  harness; widen it in the policy, not by opening it entirely.
-- Policy is JSON today; YAML is an easy add.
+**License:** no `LICENSE` file is currently published. Public source visibility does not by itself provide a reuse license. Contact the maintainers about usage and contribution terms.

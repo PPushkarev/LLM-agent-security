@@ -1,0 +1,35 @@
+name: "Bug report / Ошибка"
+description: "Report a reproducible bug. EN / RU."
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        English or Russian is welcome. Remove secrets and confidential data.
+        Можно писать на русском. Удалите секреты и конфиденциальные данные.
+        For vulnerabilities / Об уязвимостях: https://github.com/SpaceAI-UAG/LLM-agent-security/blob/main/SECURITY.md
+  - type: input
+    id: environment
+    attributes:
+      label: "Environment / Окружение"
+      description: "OS/version, Go version, harness/version, commit / ОС, Go, harness, commit"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: "Steps to reproduce / Шаги воспроизведения"
+      description: "Minimal commands and sanitized policy / Минимальные команды и обезличенная политика"
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: "Expected and actual behavior / Ожидаемое и фактическое поведение"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: "Sanitized logs / Обезличенные логи"
+      render: text
