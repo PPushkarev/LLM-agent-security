@@ -43,3 +43,7 @@ jobs:
       - name: Authors' acceptance script (attack/run_attacks.sh)
         continue-on-error: true
         run: sh attack/run_attacks.sh
+
+      - name: Authors' filter test (attack/filter_test.sh)
+        continue-on-error: true
+        run: sh attack/filter_test.sh
