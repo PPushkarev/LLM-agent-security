@@ -12,7 +12,6 @@ package sandbox
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 
@@ -73,7 +72,20 @@ func Profile(r *policy.Resolved) (string, error) {
 	// out the secret paths. A later matching rule wins in SBPL, so the denies
 	// below override the blanket allow.
 	w(";; filesystem reads")
-	w("(allow file-read* file-read-metadata)")
+	if len(r.ReadAllow) == 0 {
+		w("(allow file-read* file-read-metadata)")
+	} else {
+		w("(allow file-read-metadata)")
+		// dyld/libignition opens / as an openat root. This is not a recursive grant.
+		w(`(allow file-read* (literal "/"))`)
+		for _, path := range r.ReadAllow {
+			s, err := sbStr(path)
+			if err != nil {
+				return "", err
+			}
+			w("(allow file-read* (subpath %s))", s)
+		}
+	}
 	for _, d := range r.ReadDeny {
 		s, err := sbStr(d)
 		if err != nil {
@@ -87,13 +99,6 @@ func Profile(r *policy.Resolved) (string, error) {
 	w(";; filesystem writes")
 	for _, path := range r.Writable {
 		s, err := sbStr(path)
-		if err != nil {
-			return "", err
-		}
-		w("(allow file-write* (subpath %s))", s)
-	}
-	for _, extra := range []string{"/private/tmp", "/private/var/tmp", os.TempDir()} {
-		s, err := sbStr(strings.TrimRight(extra, "/"))
 		if err != nil {
 			return "", err
 		}
@@ -120,8 +125,13 @@ func Profile(r *policy.Resolved) (string, error) {
 	// Network: only the loopback proxy. Everything else is denied, so the agent
 	// cannot exfiltrate directly — it must go through guard's allowlisted proxy.
 	w(";; network — loopback only (the guard egress proxy)")
-	w(`(allow network-outbound (remote ip "localhost:*"))`)
-	w(`(allow network-bind (local ip "localhost:*"))`)
+	if r.ProxyPort < 0 || r.ProxyPort > 65535 {
+		return "", fmt.Errorf("invalid proxy port %d", r.ProxyPort)
+	}
+	// Port zero is an offline preview: no outbound networking is permitted.
+	if r.ProxyPort > 0 {
+		w(`(allow network-outbound (remote ip "localhost:%d"))`, r.ProxyPort)
+	}
 	w(`(allow system-socket)`)
 	w("")
 
@@ -135,6 +145,9 @@ func Profile(r *policy.Resolved) (string, error) {
 		"com.apple.dnssd.service",
 		"com.apple.coreservices.launchservicesd",
 	} {
+		if len(r.ReadAllow) > 0 && (svc == "com.apple.dnssd.service" || svc == "com.apple.system.opendirectoryd.libinfo") {
+			continue
+		}
 		w(`(allow mach-lookup (global-name "%s"))`, svc)
 	}
 	for _, svc := range []string{
@@ -144,7 +157,9 @@ func Profile(r *policy.Resolved) (string, error) {
 	} {
 		w(`(deny mach-lookup (global-name "%s"))`, svc)
 	}
-	w("(allow ipc-posix-shm)")
+	if len(r.ReadAllow) == 0 {
+		w("(allow ipc-posix-shm)")
+	}
 	w("")
 
 	return b.String(), nil

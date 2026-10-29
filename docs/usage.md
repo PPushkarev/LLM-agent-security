@@ -1,5 +1,7 @@
 # Technical guide
 
+> This guide describes the original generic proxy setup. For current Codex login, structured filtering, managed MCP and platform behavior, use the [current runtime guide (Russian)](runtime.ru.md). Where behavior differs, the runtime guide takes precedence.
+
 **English** · [Русский](usage.ru.md) · [Overview](../README.md)
 
 `guard` is the CLI name for the Guard prototype. Its three commands are `profile`, `submit` and `run`. Run commands below from the repository root.

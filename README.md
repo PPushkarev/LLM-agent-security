@@ -29,7 +29,7 @@ This repository publishes a **focused prototype from the SpaceAI initiative**. S
 
 | Control | Implementation | Practical value |
 | --- | --- | --- |
-| OS sandbox | macOS Seatbelt; experimental Linux bubblewrap backend | Apply boundaries to the harness and its child processes |
+| OS sandbox | macOS Seatbelt; Linux launch disabled pending network isolation | Apply boundaries to the harness and its child processes |
 | Filesystem policy | Writable paths, denied reads and protected persistence paths | Reduce unwanted access and changes |
 | Controlled egress | Domain allowlist and reverse-proxy routes | Make outbound destinations explicit |
 | API key injection | Parent proxy adds a configured upstream auth header | Keep provider keys out of the child environment with a correctly configured policy |
@@ -50,7 +50,7 @@ Claude Code, Codex, Hermes and custom CLI harnesses are example integration targ
 <a id="quick-start"></a>
 ## Quick start
 
-Requires **Go 1.26+**. Input filtering needs no LLM account or sandboxed harness. Actual sandbox execution requires macOS with `sandbox-exec`; the Linux backend is experimental.
+Requires **Go 1.26+**. Input filtering needs no LLM account or sandboxed harness. Actual sandbox execution requires macOS with `sandbox-exec`; Linux execution currently fails closed pending network isolation.
 
 ```sh
 git clone https://github.com/SpaceAI-UAG/LLM-agent-security.git
@@ -75,6 +75,27 @@ This is a synthetic marker, not a real secret. The enabled filter detects the pr
 
 **Next:** review [the sample policy](examples/policy.json), then follow the [harness setup and API routing guide](docs/usage.md#run-a-harness) for key injection, monitor mode, tool controls, limits and local test scripts.
 
+## Codex login and managed MCP
+
+The current implementation adds `init`, `check`, `codex` and `mcp` commands,
+ChatGPT subscription authentication through the trusted parent, structured JSON
+filters and harness-independent MCP controls. The [current runtime guide
+(Russian)](docs/runtime.ru.md) describes the full configuration and boundaries.
+
+```sh
+./guard init --workspace /absolute/path/to/project --output guard.json --auth chatgpt --model YOUR_MODEL_ID
+./guard check --policy guard.json
+./guard codex --policy guard.json
+# Other clients must use the configured model proxy and managed MCP endpoints:
+./guard run --policy guard.json -- /absolute/path/to/harness
+```
+
+Codex MCP configuration is generated automatically. Other MCP clients can consume
+the per-launch `GUARD_MCP_CONFIG` connection file or configure a stdio server
+with command `/absolute/path/to/guard` and arguments
+`["mcp", "bridge", "--server", "NAME"]`, launched inside `guard run`.
+The bridge must inherit `GUARD_MCP_CONFIG`. Backend credentials stay in the parent.
+
 ## How it works
 
 | Component | Responsibility |
@@ -84,13 +105,13 @@ This is a synthetic marker, not a real secret. The enabled filter detects the pr
 | Egress proxy | Checks destinations; configured routes add method/path/query rules and auth headers |
 | Content filter | Inspects submitted prompts and configured reverse-proxy traffic; optionally logs filter decisions |
 
-Controls apply around the harness, including its shells, interpreters and local MCP server processes. This does not add application-level authorization to a remote MCP server or corporate API.
+Controls apply around the harness and its children. Managed MCP servers additionally use a parent-side gateway with per-tool permissions, argument/result filtering, approval requests, limits and audit. Clients connect through Streamable HTTP or the `guard mcp bridge --server NAME` stdio adapter; see the [current runtime guide (Russian)](docs/runtime.ru.md).
 
 <a id="current-boundaries"></a>
 ## Current boundaries
 
 - **Prototype:** use a disposable environment. No independent security audit or certification is claimed.
-- **Backend differences:** macOS permits loopback connections broadly, not just the proxy port. Linux has no bridge from its network namespace to the parent proxy yet; per-binary `exec` rules are not enforced on Linux.
+- **Backend differences:** macOS restricts network access to the guard proxy port. Linux execution fails closed because its network namespace has no bridge to the parent proxy. Windows is unsupported.
 - **Inspection scope:** configured reverse-proxy routes are inspected; encrypted HTTPS `CONNECT` payloads and streaming SSE responses are not. Regex rules do not provide complete prompt-injection or data-loss prevention.
 - **Policy matters:** filesystem reads are broadly allowed except configured exclusions. Review writable paths, environment passthrough, local services and audit-log placement.
 

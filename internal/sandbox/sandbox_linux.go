@@ -1,12 +1,12 @@
 //go:build linux
 
-// Linux backend: bubblewrap (bwrap). This is "chroot done right" — a mount +
-// pid + net namespace. The root filesystem is bind-mounted read-only, the
-// workspace read-write, HOME is a throwaway tmpfs, and the network namespace is
-// unshared so the ONLY reachable endpoint is the guard proxy on loopback.
+// Linux backend is disabled until its network namespace has a transport to
+// the trusted parent proxy. The argument builder is retained for that work;
+// Profile fails closed so callers cannot mistake it for a usable sandbox.
 package sandbox
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 
@@ -16,16 +16,7 @@ import (
 // Profile returns the bwrap argument vector as a human-readable string for
 // --dry-run review. (On Linux there is no SBPL text; this is the arg list.)
 func Profile(r *policy.Resolved) (string, error) {
-	args := bwrapArgs(r)
-	out := "bwrap \\\n"
-	for i := 0; i < len(args); i += 2 {
-		if i+1 < len(args) {
-			out += "  " + args[i] + " " + args[i+1] + " \\\n"
-		} else {
-			out += "  " + args[i] + " \\\n"
-		}
-	}
-	return out, nil
+	return "", fmt.Errorf("Linux backend is not ready: isolated proxy transport is not implemented; use macOS Seatbelt")
 }
 
 func bwrapArgs(r *policy.Resolved) []string {
