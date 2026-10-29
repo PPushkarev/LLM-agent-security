@@ -12,17 +12,18 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 
 	"guard/internal/filter"
+	"guard/internal/mcpguard"
 	"guard/internal/policy"
 	"guard/internal/proxy"
 	"guard/internal/sandbox"
@@ -33,6 +34,14 @@ func main() {
 		usage()
 	}
 	switch os.Args[1] {
+	case "mcp":
+		mcpCmd(os.Args[2:])
+	case "check":
+		checkCmd(os.Args[2:])
+	case "init":
+		initCmd(os.Args[2:])
+	case "codex":
+		codexCmd(os.Args[2:])
 	case "run":
 		runCmd(os.Args[2:])
 	case "submit":
@@ -48,6 +57,11 @@ func usage() {
 	fmt.Fprint(os.Stderr, `guard — sandbox any agent harness
 
 usage:
+  guard mcp pending|approve|deny --policy FILE [--id ID]
+  guard mcp bridge --server NAME  (inside guard run; uses GUARD_MCP_CONFIG)
+  guard check   --policy FILE         validate policy and backend
+  guard init    --workspace DIR [--output guard.json] [--auth chatgpt|api] [--model MODEL]
+  guard codex   --policy FILE [--dry-run] -- [CODEX ARGS...]
   guard run     --policy FILE [--dry-run] -- HARNESS [ARGS...]
   guard submit  --policy FILE [--prompt TEXT] [-- HARNESS ARGS...]
                 filter a prompt (block/mask) before the harness sees it
@@ -118,7 +132,13 @@ func submitCmd(args []string) {
 	if havePrompt {
 		prompt = []byte(promptArg)
 	} else {
-		prompt, _ = io.ReadAll(os.Stdin) // prompt piped on stdin
+		prompt, err = io.ReadAll(io.LimitReader(os.Stdin, (8<<20)+1))
+		if err != nil {
+			die("read prompt: %v", err)
+		}
+		if len(prompt) > 8<<20 {
+			die("prompt exceeds 8 MiB limit")
+		}
 	}
 
 	f, err := filter.New(r.PromptFilter)
@@ -127,6 +147,9 @@ func submitCmd(args []string) {
 	}
 	defer f.Close()
 	cleaned, d := f.Request(prompt)
+	if err := f.AuditError(); err != nil {
+		die("audit write failed: %v", err)
+	}
 
 	logger := log.New(os.Stderr, "\x1b[2m[guard]\x1b[0m ", 0)
 	if len(d.Flagged) > 0 {
@@ -185,19 +208,35 @@ func runCmd(args []string) {
 
 // launch sets up the proxy + sandbox and runs argv with the given stdin.
 func launch(r *policy.Resolved, dryRun bool, argv []string, stdin io.Reader) {
+	finishLaunch(runLaunch(r, dryRun, argv, stdin, false))
+}
+func finishLaunch(err error) {
+	if err == nil {
+		return
+	}
+	if code, ok := asExit(err); ok {
+		if code < 0 {
+			code = 1
+		}
+		os.Exit(code)
+	}
+	die("%v", err)
+}
+func runLaunch(r *policy.Resolved, dryRun bool, argv []string, stdin io.Reader, codex bool) error {
 	logger := log.New(os.Stderr, "\x1b[2m[guard]\x1b[0m ", 0)
 
 	// 1. Start the egress proxy in the trusted parent (secrets live here only).
 	px, err := proxy.New(r, logger)
 	if err != nil {
-		die("proxy: %v", err)
+		return fmt.Errorf("proxy: %v", err)
 	}
+	defer px.CloseFilter()
+	r.ReadDeny = append(r.ReadDeny, px.CredentialPaths()...)
 	port, err := px.Start(r.ProxyPort)
 	if err != nil {
-		die("proxy listen: %v", err)
+		return fmt.Errorf("proxy listen: %v", err)
 	}
 	defer px.Close()
-	defer px.CloseFilter()
 	logger.Printf("backend=%s", sandbox.Backend())
 	logger.Printf("workspace=%s", r.Workspace)
 	logger.Printf("egress proxy on 127.0.0.1:%d (allow: %s)", port, strings.Join(r.AllowDomains, ", "))
@@ -212,19 +251,76 @@ func launch(r *policy.Resolved, dryRun bool, argv []string, stdin io.Reader) {
 		logger.Printf("limits ON (max_requests=%d rate_per_min=%d max_request_bytes=%d)", l.MaxRequests, l.RatePerMin, l.MaxRequestBytes)
 	}
 
+	r.ProxyPort = port
+
+	scratch, err := os.MkdirTemp("", "guard-tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(scratch)
+	scratch, err = filepath.EvalSymlinks(scratch)
+	if err != nil {
+		return err
+	}
+	r.Writable = append(r.Writable, scratch)
+	extraEnv := []string{"TMPDIR=" + scratch}
+	var gatewayToken string
+	{
+		if len(r.MCP.Servers) > 0 {
+			r.ReadDeny = append(r.ReadDeny, r.MCP.AuditLog, r.MCP.ApprovalDir)
+			r.SelfProtect = append(r.SelfProtect, r.MCP.AuditLog, r.MCP.ApprovalDir)
+		}
+		if len(r.MCP.Servers) > 0 && !dryRun {
+			gateway, e := mcpguard.New(context.Background(), r.MCP, r.PromptFilter, mcpCommandFactory(r))
+			if e != nil {
+				return fmt.Errorf("MCP gateway: %w", e)
+			}
+			defer gateway.Close()
+			gatewayToken = gateway.Token()
+			px.SetMCP(gateway)
+		}
+	}
+	if codex {
+		var cleanup func()
+		argv, extraEnv, cleanup, err = prepareCodex(r, port, argv, gatewayToken)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+	}
+
+	if len(r.MCP.Servers) > 0 {
+		manifest := filepath.Join(scratch, "mcp.json")
+		if err := writeMCPConnections(manifest, r.MCP, port, gatewayToken); err != nil {
+			return err
+		}
+		r.SelfProtect = append(r.SelfProtect, manifest)
+		extraEnv = append(extraEnv, "GUARD_MCP_CONFIG="+manifest)
+	}
+
 	// 2. Write the generated profile where the sandbox can read it.
 	profText, err := sandbox.Profile(r)
 	if err != nil {
-		die("profile: %v", err)
+		return fmt.Errorf("profile: %v", err)
 	}
-	profPath := filepath.Join(os.TempDir(), fmt.Sprintf("guard-%d.sb", os.Getpid()))
-	if err := os.WriteFile(profPath, []byte(profText), 0600); err != nil {
-		die("write profile: %v", err)
+	prof, err := os.CreateTemp("", "guard-*.sb")
+	if err != nil {
+		return err
 	}
+	profPath := prof.Name()
 	defer os.Remove(profPath)
+	_, writeErr := prof.WriteString(profText)
+	closeErr := prof.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
 
 	// 3. Build the scrubbed environment the child will see.
 	env := buildEnv(r, port)
+	env = overrideEnv(env, extraEnv)
 
 	if dryRun {
 		fmt.Println("=== sandbox profile ===")
@@ -234,35 +330,35 @@ func launch(r *policy.Resolved, dryRun bool, argv []string, stdin io.Reader) {
 			fmt.Println("  " + e)
 		}
 		fmt.Printf("=== would exec ===\n  %s\n", strings.Join(argv, " "))
-		return
+		return nil
 	}
 
 	// 4. Launch the harness under the sandbox.
 	cmd := buildCommand(r, profPath, env, argv)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, os.Stdout, os.Stderr
 
-	// Forward signals so Ctrl-C reaches the harness.
+	cmd.Dir = r.Workspace
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start harness: %w", err)
+	}
 	sig := make(chan os.Signal, 1)
+	done := make(chan struct{})
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sig)
+	defer close(done)
 	go func() {
-		for s := range sig {
-			if cmd.Process != nil {
-				cmd.Process.Signal(s)
+		for {
+			select {
+			case s := <-sig:
+				_ = cmd.Process.Signal(s)
+			case <-done:
+				return
 			}
 		}
 	}()
-
-	err = cmd.Run()
+	err = cmd.Wait()
 	logger.Printf("egress denials: %d · prompt-filter actions: %d · throttled: %d", px.DenyCount(), px.FilterCount(), px.LimitCount())
-	if err != nil {
-		if ee, ok := err.(*exitError); ok {
-			os.Exit(ee.code)
-		}
-		if ee, ok := asExit(err); ok {
-			os.Exit(ee)
-		}
-		die("run: %v", err)
-	}
+	return err
 }
 
 // buildEnv implements default-deny for the environment. Only names in
@@ -285,6 +381,8 @@ func buildEnv(r *policy.Resolved, port int) []string {
 		"https_proxy="+proxyURL,
 		"GUARD_PROXY="+proxyURL,
 		"GUARD_SANDBOX=1",
+		"NO_PROXY=127.0.0.1,localhost",
+		"no_proxy=127.0.0.1,localhost",
 	)
 	// Point each key-injection route's base URL at the proxy prefix.
 	for _, ki := range r.KeyInject {
@@ -304,10 +402,6 @@ func die(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, "guard: "+format+"\n", a...)
 	os.Exit(1)
 }
-
-type exitError struct{ code int }
-
-func (e *exitError) Error() string { return "exit " + strconv.Itoa(e.code) }
 
 func asExit(err error) (int, bool) {
 	type coder interface{ ExitCode() int }

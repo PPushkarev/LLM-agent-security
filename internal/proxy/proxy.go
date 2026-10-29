@@ -7,6 +7,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -21,23 +22,29 @@ import (
 	"sync"
 	"time"
 
+	"guard/internal/credential"
 	"guard/internal/filter"
 	"guard/internal/policy"
 )
 
+// Hard buffering ceilings also apply in monitor mode and with filtering disabled.
+const maxBufferedBody = 8 << 20
+
 // Proxy is an HTTP server bound to loopback.
 type Proxy struct {
-	allow       map[string]bool // exact host allowlist for CONNECT
-	routes      []route         // key-injection reverse routes
-	filter      *filter.Filter  // content firewall on LLM traffic
-	lim         *limiter        // rate / budget caps
-	logger      *log.Logger
-	ln          net.Listener
-	srv         *http.Server
-	mu          sync.Mutex
-	denyCount   int
-	filterCount int
-	limitCount  int
+	mcp           http.Handler
+	allow         map[string]bool // exact host allowlist for CONNECT
+	routes        []route         // key-injection reverse routes
+	filter        *filter.Filter  // content firewall on LLM traffic
+	maxFilterBody int
+	lim           *limiter // rate / budget caps
+	logger        *log.Logger
+	ln            net.Listener
+	srv           *http.Server
+	mu            sync.Mutex
+	denyCount     int
+	filterCount   int
+	limitCount    int
 }
 
 // limiter enforces per-session request-count, rate (fixed 60s window) and
@@ -87,13 +94,17 @@ func (l *limiter) admit(nbytes int64) (bool, string) {
 	return true, ""
 }
 
+type credentialHeadersKey struct{}
+
 type route struct {
+	auth     *credential.Provider
 	prefix   string
 	upstream *url.URL
 	header   string
 	value    string // resolved from guard's env at startup
 	methods  map[string]bool
 	paths    []string // allowed upstream path prefixes
+	json     *filter.JSONFilter
 	query    *queryPolicy
 	rp       *httputil.ReverseProxy
 }
@@ -121,7 +132,7 @@ func (rt route) allows(method, upstreamPath string) bool {
 	if len(rt.paths) > 0 {
 		ok := false
 		for _, p := range rt.paths {
-			if strings.HasPrefix(upstreamPath, p) {
+			if upstreamPath == p || (strings.HasSuffix(p, "/") && strings.HasPrefix(upstreamPath, p)) {
 				ok = true
 				break
 			}
@@ -141,7 +152,13 @@ func New(r *policy.Resolved, logger *log.Logger) (*Proxy, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &Proxy{allow: map[string]bool{}, filter: f, logger: logger}
+	p := &Proxy{allow: map[string]bool{}, filter: f, logger: logger, maxFilterBody: r.PromptFilter.MaxBodyBytes}
+	success := false
+	defer func() {
+		if !success {
+			f.Close()
+		}
+	}()
 	if r.Limits.MaxRequests > 0 || r.Limits.RatePerMin > 0 || r.Limits.MaxRequestBytes > 0 {
 		p.lim = newLimiter(r.Limits.MaxRequests, r.Limits.RatePerMin, r.Limits.MaxRequestBytes)
 	}
@@ -151,14 +168,45 @@ func New(r *policy.Resolved, logger *log.Logger) (*Proxy, error) {
 	for _, ki := range r.KeyInject {
 		u, err := url.Parse(ki.Upstream)
 		if err != nil {
-			return nil, fmt.Errorf("key_injection upstream %q: %w", ki.Upstream, err)
+			return nil, fmt.Errorf("key_injection upstream: %w", err)
+		}
+		if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+			return nil, fmt.Errorf("key_injection upstream must be an http(s) origin without credentials, path or query")
+		}
+		if ki.Prefix == "" || !strings.HasPrefix(ki.Prefix, "/") || strings.HasSuffix(ki.Prefix, "/") {
+			return nil, fmt.Errorf("route prefix must start with / and have no trailing /")
 		}
 		val := os.Getenv(ki.Env)
+		if ki.Env != "" && val == "" {
+			return nil, fmt.Errorf("required credential environment variable %s is empty", ki.Env)
+		}
+		if val != "" {
+			f.ProtectSecret(val)
+			val = ki.HeaderPrefix + val
+		}
+		jf, err := filter.NewJSON(ki.JSON)
+		if err != nil {
+			return nil, err
+		}
 		methods := map[string]bool{}
 		for _, m := range ki.Methods {
 			methods[strings.ToUpper(m)] = true
 		}
-		rt := route{prefix: ki.Prefix, upstream: u, header: ki.Header, value: val, methods: methods, paths: ki.AllowPaths}
+		var provider *credential.Provider
+		if ki.Auth.Type != "" {
+			provider, err = credential.New(ki.Auth)
+			if err != nil {
+				return nil, err
+			}
+			secrets, err := provider.Secrets()
+			if err != nil {
+				return nil, err
+			}
+			for _, secret := range secrets {
+				f.ProtectSecret(secret)
+			}
+		}
+		rt := route{auth: provider, json: jf, prefix: ki.Prefix, upstream: u, header: ki.Header, value: val, methods: methods, paths: ki.AllowPaths}
 		if ki.Query.Enabled() {
 			qp := &queryPolicy{allow: map[string]bool{}, deny: map[string]bool{}, maxLen: ki.Query.MaxParamLen}
 			for _, a := range ki.Query.AllowParams {
@@ -185,16 +233,28 @@ func New(r *policy.Resolved, logger *log.Logger) (*Proxy, error) {
 				req.URL.Host = up.Host
 				req.Host = up.Host
 				req.URL.Path = strings.TrimPrefix(req.URL.Path, prefix)
+				req.URL.RawPath = ""
+				req.Header.Del("Authorization")
+				req.Header.Del("Proxy-Authorization")
+				req.Header.Del("ChatGPT-Account-ID")
+				if hdr != "" {
+					req.Header.Del(hdr)
+				}
 				if val != "" {
 					req.Header.Set(hdr, val)
+				}
+				if headers, ok := req.Context().Value(credentialHeadersKey{}).(http.Header); ok {
+					for k, v := range headers {
+						req.Header[k] = append([]string(nil), v...)
+					}
 				}
 			},
 			ModifyResponse: p.scanResponse,
 		}
 		p.routes = append(p.routes, rt)
-		// The allowlist must also cover the upstream host for consistency.
-		p.allow[strings.ToLower(hostOnly(u.Host))] = true
+
 	}
+	success = true
 	return p, nil
 }
 
@@ -213,7 +273,7 @@ func (p *Proxy) Start(port int) (int, error) {
 		return 0, err
 	}
 	p.ln = ln
-	p.srv = &http.Server{Handler: p}
+	p.srv = &http.Server{Handler: p, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
 		if err := p.srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			p.logger.Printf("proxy serve error: %v", err)
@@ -248,9 +308,26 @@ func (p *Proxy) deny(w http.ResponseWriter, host, why string) {
 // admit applies the rate/budget limiter. Returns false (429 already written) if
 // the request must be rejected.
 func (p *Proxy) admit(w http.ResponseWriter, req *http.Request) bool {
-	nbytes := req.ContentLength
-	if nbytes < 0 {
-		nbytes = 0
+	var nbytes int64
+	if req.Method != http.MethodConnect && req.Body != nil {
+		// Count actual bytes, including chunked requests, before atomically
+		// admitting them against the shared session budget.
+		body, err := io.ReadAll(io.LimitReader(req.Body, maxBufferedBody+1))
+		req.Body.Close()
+		if err != nil {
+			http.Error(w, "read body failed", http.StatusBadRequest)
+			return false
+		}
+		if len(body) > maxBufferedBody {
+			http.Error(w, "request body exceeds buffering limit", http.StatusRequestEntityTooLarge)
+			return false
+		}
+		nbytes = int64(len(body))
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		req.ContentLength = nbytes
+		req.TransferEncoding = nil
+		req.Header.Del("Transfer-Encoding")
+		req.Header.Del("Content-Length")
 	}
 	ok, why := p.lim.admit(nbytes)
 	if ok {
@@ -264,7 +341,24 @@ func (p *Proxy) admit(w http.ResponseWriter, req *http.Request) bool {
 	return false
 }
 
+func (p *Proxy) SetMCP(h http.Handler) { p.mu.Lock(); defer p.mu.Unlock(); p.mcp = h }
+
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if strings.HasPrefix(req.URL.Path, "/__guard/") {
+		p.mu.Lock()
+		h := p.mcp
+		p.mu.Unlock()
+		if h == nil {
+			http.NotFound(w, req)
+			return
+		}
+		h.ServeHTTP(w, req)
+		return
+	}
+	if req.Header.Get("Upgrade") != "" {
+		p.deny(w, req.Host, "protocol upgrades are disabled; use HTTP/SSE")
+		return
+	}
 	// CONNECT = HTTPS tunnel. Check the host allowlist, then splice sockets.
 	if req.Method == http.MethodConnect {
 		host := hostOnly(req.Host)
@@ -282,7 +376,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// Plain HTTP: either a key-injection route (path-prefixed) or a forward
 	// proxy request to an allowlisted host.
 	for _, rt := range p.routes {
-		if strings.HasPrefix(req.URL.Path, rt.prefix) {
+		if req.URL.Path == rt.prefix || strings.HasPrefix(req.URL.Path, rt.prefix+"/") {
 			upstreamPath := strings.TrimPrefix(req.URL.Path, rt.prefix)
 			if !rt.allows(req.Method, upstreamPath) {
 				p.mu.Lock()
@@ -301,8 +395,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			if !p.filterURL(w, req, rt.prefix) {
 				return // blocked by the content firewall (URL/query)
 			}
-			if !p.filterRequest(w, req) {
+			if !p.filterRequest(w, req, rt.json) {
 				return // blocked by the content firewall (body)
+			}
+			if rt.auth != nil {
+				headers, err := rt.auth.Headers(req.Context())
+				if err != nil {
+					p.logger.Printf("Codex authentication unavailable: %v", err)
+					http.Error(w, "Codex authentication unavailable; log in outside guard", http.StatusServiceUnavailable)
+					return
+				}
+				// Values are consumed by the reverse proxy only after filtering.
+				req = req.WithContext(context.WithValue(req.Context(), credentialHeadersKey{}, headers))
 			}
 			p.logger.Printf("ALLOW inject %s %s -> %s", req.Method, upstreamPath, rt.upstream)
 			rt.rp.ServeHTTP(w, req)
@@ -353,17 +457,45 @@ func (p *Proxy) tunnel(w http.ResponseWriter, req *http.Request) {
 // returns false (and has already written the response) if the request was
 // blocked. On allow/redact it replaces the body so the (possibly redacted)
 // bytes are what actually get sent upstream.
-func (p *Proxy) filterRequest(w http.ResponseWriter, req *http.Request) bool {
-	if p.filter == nil || !p.filter.Enabled() || req.Body == nil {
+func (p *Proxy) filterRequest(w http.ResponseWriter, req *http.Request, jf *filter.JSONFilter) bool {
+	if encoding := req.Header.Get("Content-Encoding"); encoding != "" && !strings.EqualFold(encoding, "identity") {
+		p.queryBlock(w, "encoded request bodies are not supported")
+		return false
+	}
+	if req.Body == nil {
 		return true
 	}
-	body, err := io.ReadAll(req.Body)
+	body, err := io.ReadAll(io.LimitReader(req.Body, maxBufferedBody+1))
 	req.Body.Close()
 	if err != nil {
 		http.Error(w, "read body: "+err.Error(), http.StatusBadGateway)
 		return false
 	}
-	out, d := p.filter.Request(body)
+	if len(body) > maxBufferedBody {
+		http.Error(w, "request body exceeds buffering limit", http.StatusRequestEntityTooLarge)
+		return false
+	}
+	var out []byte
+	var d filter.Decision
+	if jf != nil {
+		out, d = jf.Request(body, p.filter)
+	} else {
+		out, d = p.filter.Request(body)
+	}
+	if p.maxFilterBody > 0 && len(body) > p.maxFilterBody {
+		_, sizeDecision := p.filter.Request(body)
+		if sizeDecision.Action == filter.Block {
+			out, d = body, sizeDecision
+		} else {
+			d.Flagged = append(d.Flagged, sizeDecision.Flagged...)
+		}
+	}
+	p.filter.Record("request-body", d)
+	if err := p.filter.AuditError(); err != nil {
+		p.logger.Printf("audit write failed: %v", err)
+		http.Error(w, "guard audit log unavailable", http.StatusServiceUnavailable)
+		return false
+	}
 	if len(d.Flagged) > 0 {
 		// Flag = detected but the prompt was NOT changed or stopped.
 		p.logger.Printf("FILTER FLAG request rules=%s (prompt forwarded unchanged)", strings.Join(d.Flagged, ","))
@@ -426,7 +558,7 @@ func (p *Proxy) filterQuery(w http.ResponseWriter, req *http.Request, rt route) 
 					p.queryBlock(w, "forbidden value in parameter: "+key)
 					return false
 				case filter.Redact:
-					list[i] = pr.re.ReplaceAllString(v, "[REDACTED]")
+					list[i] = pr.re.ReplaceAllString(list[i], "[REDACTED]")
 					changed = true
 					p.logger.Printf("\x1b[33mFILTER REDACT query param=%s\x1b[0m", key)
 				default: // flag
@@ -446,6 +578,7 @@ func (p *Proxy) queryBlock(w http.ResponseWriter, why string) {
 	p.mu.Lock()
 	p.filterCount++
 	p.mu.Unlock()
+	p.filter.Record("request-query", filter.Decision{Action: filter.Block, Rule: why})
 	p.logger.Printf("FILTER BLOCK query: %s", why)
 	http.Error(w, "blocked by guard query policy: "+why, http.StatusForbidden)
 }
@@ -491,12 +624,18 @@ func (p *Proxy) scanResponse(resp *http.Response) error {
 	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
 		return nil
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBufferedBody+1))
 	resp.Body.Close()
 	if err != nil {
 		return err
 	}
+	if len(body) > maxBufferedBody {
+		return fmt.Errorf("response body exceeds buffering limit")
+	}
 	_, d := p.filter.Response(body)
+	if err := p.filter.AuditError(); err != nil {
+		return fmt.Errorf("audit write failed: %w", err)
+	}
 	if len(d.Flagged) > 0 {
 		p.logger.Printf("FILTER FLAG response rules=%s (output forwarded unchanged)", strings.Join(d.Flagged, ","))
 	}
@@ -547,4 +686,14 @@ func (p *Proxy) forward(w http.ResponseWriter, req *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+func (p *Proxy) CredentialPaths() []string {
+	var paths []string
+	for _, rt := range p.routes {
+		if rt.auth != nil {
+			paths = append(paths, rt.auth.Home())
+		}
+	}
+	return paths
 }

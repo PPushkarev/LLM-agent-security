@@ -95,10 +95,11 @@ type Filter struct {
 	respBlock []compiledRule
 	mu        sync.Mutex
 	auditFile *os.File
+	auditErr  error
 }
 
-// ParseAction maps a policy action string to an Action ("flag" and anything
-// unrecognized → Allow, i.e. detect-but-forward).
+// ParseAction maps policy actions to outcomes. Empty/unknown values use def;
+// policy validation rejects unknown actions before startup.
 func ParseAction(s string, def Action) Action { return parseAction(s, def) }
 
 func parseAction(s string, def Action) Action {
@@ -120,7 +121,7 @@ var builtinBlock = []Rule{
 	{Name: "pem_private_key", Pattern: `-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----`},
 	{Name: "aws_access_key", Pattern: `\bAKIA[0-9A-Z]{16}\b`},
 	{Name: "anthropic_key", Pattern: `\bsk-ant-[A-Za-z0-9_-]{20,}\b`},
-	{Name: "openai_key", Pattern: `\bsk-[A-Za-z0-9]{32,}\b`},
+	{Name: "openai_key", Pattern: `\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b`},
 	{Name: "github_token", Pattern: `\bgh[pousr]_[A-Za-z0-9]{20,}\b`},
 	{Name: "gcp_sa_key", Pattern: `"private_key_id"\s*:\s*"[0-9a-f]{20,}"`},
 }
@@ -128,6 +129,9 @@ var builtinBlock = []Rule{
 func compile(rules []Rule, def Action) ([]compiledRule, error) {
 	var out []compiledRule
 	for _, r := range rules {
+		if !validAction(r.Action) {
+			return nil, fmt.Errorf("filter rule %q: invalid action %q", r.Name, r.Action)
+		}
 		re, err := regexp.Compile(r.Pattern)
 		if err != nil {
 			return nil, fmt.Errorf("filter rule %q: %w", r.Name, err)
@@ -140,6 +144,12 @@ func compile(rules []Rule, def Action) ([]compiledRule, error) {
 // New compiles a Config into a Filter. A disabled or zero Config yields a
 // pass-through filter.
 func New(cfg Config) (*Filter, error) {
+	if cfg.Mode != "" && cfg.Mode != "enforce" && cfg.Mode != "monitor" {
+		return nil, fmt.Errorf("invalid filter mode %q", cfg.Mode)
+	}
+	if cfg.MaxBodyBytes < 0 {
+		return nil, fmt.Errorf("max_body_bytes must not be negative")
+	}
 	f := &Filter{cfg: cfg, literals: cfg.LiteralRedact}
 	if !cfg.Enabled {
 		return f, nil
@@ -188,8 +198,11 @@ func (f *Filter) audit(direction string, d Decision, extra string) {
 	if d.Monitored {
 		mode = "monitor"
 	}
-	fmt.Fprintf(f.auditFile, "%s\t%s\t%s\tmode=%s\trule=%s\tcount=%d\tflagged=%s\t%s\n",
+	_, err := fmt.Fprintf(f.auditFile, "%s\t%s\t%s\tmode=%s\trule=%s\tcount=%d\tflagged=%s\t%s\n",
 		time.Now().UTC().Format(time.RFC3339), direction, d.Action, mode, d.Rule, d.Count, flags, extra)
+	if err != nil {
+		f.auditErr = err
+	}
 }
 
 // Request inspects an outbound prompt body. It returns the (possibly redacted)
@@ -222,16 +235,45 @@ func (f *Filter) URL(rawPath, rawQuery string) (string, Decision) {
 	if !f.cfg.Enabled || (rawPath == "" && rawQuery == "") {
 		return rawQuery, Decision{Action: Allow}
 	}
-	decoded := rawQuery
-	if q, err := url.QueryUnescape(rawQuery); err == nil {
-		decoded = q
+	vals, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		if f.cfg.monitor() {
+			d := Decision{Action: Allow, Monitored: true, Flagged: []string{"would-block:malformed_query"}}
+			f.audit("request-url", d, "")
+			return rawQuery, d
+		}
+		d := Decision{Action: Block, Rule: "malformed_query"}
+		f.audit("request-url", d, "")
+		return rawQuery, d
 	}
+	decoded, _ := url.QueryUnescape(rawQuery)
 	_, d := f.scan("request-url", []byte(rawPath+"?"+decoded))
 	if d.Action == Redact {
-		// Best-effort: rewrite matched spans in the raw query. Percent-encoded
-		// values that only match after decoding are blocked rather than redacted.
-		out, _ := f.applyRedactions([]byte(rawQuery), f.matchingRedactRules([]byte(decoded)))
-		return string(out), d
+		// A path cannot be rewritten without changing routing. Fail closed.
+		_, pathCount := f.applyRedactions([]byte(rawPath), f.matchingRedactRules([]byte(rawPath)))
+		if pathCount > 0 {
+			d.Action, d.Rule = Block, "redaction_in_path"
+			f.audit("request-url", d, "")
+			return rawQuery, d
+		}
+		cleaned := url.Values{}
+		for key, values := range vals {
+			outKey, _ := f.applyRedactions([]byte(key), f.matchingRedactRules([]byte(key)))
+			for _, value := range values {
+				out, _ := f.applyRedactions([]byte(value), f.matchingRedactRules([]byte(value)))
+				cleaned[string(outKey)] = append(cleaned[string(outKey)], string(out))
+			}
+		}
+		result := cleaned.Encode()
+		// Rules spanning parameter boundaries cannot safely be rewritten per value.
+		check, _ := url.QueryUnescape(result)
+		_, remaining := f.applyRedactions([]byte(rawPath+"?"+check), f.matchingRedactRules([]byte(rawPath+"?"+check)))
+		if remaining > 0 {
+			d.Action, d.Rule = Block, "unredactable_query"
+			f.audit("request-url", d, "")
+			return rawQuery, d
+		}
+		return result, d
 	}
 	return rawQuery, d
 }
@@ -364,3 +406,17 @@ func (f *Filter) Close() error {
 	}
 	return nil
 }
+
+// ProtectSecret blocks the exact credential as well as generic token patterns.
+// Call only during proxy initialization, before serving concurrent requests.
+func (f *Filter) ProtectSecret(value string) {
+	if value != "" && f.Enabled() {
+		f.reqRules = append([]compiledRule{{name: "proxy_credential", re: regexp.MustCompile(regexp.QuoteMeta(value)), action: Block}}, f.reqRules...)
+	}
+}
+
+// Record logs a structured route decision without including payload contents.
+func (f *Filter) Record(direction string, d Decision) { f.audit(direction, d, "") }
+
+// AuditError reports persistent audit write failures so callers can fail closed.
+func (f *Filter) AuditError() error { f.mu.Lock(); defer f.mu.Unlock(); return f.auditErr }

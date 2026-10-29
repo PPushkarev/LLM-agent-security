@@ -12,7 +12,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	"guard/internal/credential"
 	"guard/internal/filter"
+	"guard/internal/mcpguard"
 )
 
 // KeyInjection describes a reverse-proxy route that adds an auth header the
@@ -20,13 +22,17 @@ import (
 // http://127.0.0.1:<port><Prefix>; guard forwards to Upstream and attaches
 // Header with the value taken from guard's own environment (Env).
 type KeyInjection struct {
-	Prefix   string `json:"prefix"`   // e.g. "/anthropic"
-	Upstream string `json:"upstream"` // e.g. "https://api.anthropic.com"
-	Header   string `json:"header"`   // e.g. "x-api-key"
-	Env      string `json:"env"`      // name of env var in guard holding the secret
+	Auth         credential.Config `json:"auth"`
+	Prefix       string            `json:"prefix"`        // e.g. "/anthropic"
+	Upstream     string            `json:"upstream"`      // e.g. "https://api.anthropic.com"
+	Header       string            `json:"header"`        // e.g. "x-api-key"
+	Env          string            `json:"env"`           // name of env var in guard holding the secret
+	HeaderPrefix string            `json:"header_prefix"` // e.g. "Bearer "
+	JSON         filter.JSONPolicy `json:"json"`
 	// Request allowlist (default-deny when non-empty). The agent may only issue
 	// requests whose method is in Methods AND whose upstream path (after the
-	// prefix is stripped) starts with one of AllowPaths. Empty list = allow any.
+	// prefix is stripped) equals an AllowPaths entry. A trailing / permits a
+	// subtree. Empty list = allow any.
 	Methods    []string `json:"methods"`
 	AllowPaths []string `json:"allow_paths"`
 	// Structured query-parameter policy (e.g. for a search endpoint): control
@@ -58,18 +64,26 @@ func (q QueryPolicy) Enabled() bool {
 }
 
 // Policy is the raw, as-written form.
+type Codex struct {
+	Model  string `json:"model"`
+	Route  string `json:"route"`
+	Binary string `json:"binary"`
+}
+
 type Policy struct {
-	Workspace    string         `json:"workspace"`     // the one directory the agent may write in
-	Writable     []string       `json:"writable"`      // extra writable paths
-	ReadDeny     []string       `json:"read_deny"`     // paths the agent may not read (secrets)
-	SelfProtect  []string       `json:"self_protect"`  // paths inside writable the agent may NOT write (persistence)
-	AllowDomains []string       `json:"allow_domains"` // domains reachable through the proxy
-	EnvAllow     []string       `json:"env_allow"`     // env var names passed through verbatim
-	ProxyPort    int            `json:"proxy_port"`    // 0 = auto-assign
-	KeyInject    []KeyInjection `json:"key_injection"`
-	PromptFilter filter.Config  `json:"prompt_filter"` // content firewall on LLM traffic
-	Exec         ExecPolicy     `json:"exec"`          // which executables the agent may run
-	Limits       Limits         `json:"limits"`        // rate / budget caps on egress
+	MCP          mcpguard.Config `json:"mcp"`
+	Codex        Codex           `json:"codex"`
+	Workspace    string          `json:"workspace"`     // the one directory the agent may write in
+	Writable     []string        `json:"writable"`      // extra writable paths
+	ReadDeny     []string        `json:"read_deny"`     // paths the agent may not read (secrets)
+	SelfProtect  []string        `json:"self_protect"`  // paths inside writable the agent may NOT write (persistence)
+	AllowDomains []string        `json:"allow_domains"` // domains reachable through the proxy
+	EnvAllow     []string        `json:"env_allow"`     // env var names passed through verbatim
+	ProxyPort    int             `json:"proxy_port"`    // 0 = auto-assign
+	KeyInject    []KeyInjection  `json:"key_injection"`
+	PromptFilter filter.Config   `json:"prompt_filter"` // content firewall on LLM traffic
+	Exec         ExecPolicy      `json:"exec"`          // which executables the agent may run
+	Limits       Limits          `json:"limits"`        // rate / budget caps on egress
 }
 
 // Limits caps how much the agent can send out this session, so even permitted
@@ -93,6 +107,8 @@ type ExecPolicy struct {
 // Resolved is Policy with ~ and relative paths expanded to absolute paths, and
 // with self-protected paths resolved relative to the workspace.
 type Resolved struct {
+	MCP          mcpguard.Config
+	ReadAllow    []string // optional read allowlist used for managed MCP processes
 	Raw          Policy
 	Workspace    string
 	Writable     []string // absolute, includes Workspace
@@ -120,7 +136,7 @@ func expand(home, base, p string) (string, error) {
 	if !filepath.IsAbs(p) {
 		p = filepath.Join(base, p)
 	}
-	return filepath.Clean(p), nil
+	return canonical(p)
 }
 
 // Load reads, parses and resolves a policy file.
@@ -136,6 +152,10 @@ func Load(path string) (*Resolved, error) {
 		return nil, fmt.Errorf("parse policy: %w", err)
 	}
 
+	if err := ensureEOF(dec); err != nil {
+		return nil, err
+	}
+
 	home, _ := os.UserHomeDir()
 	cwd, _ := os.Getwd()
 
@@ -149,6 +169,7 @@ func Load(path string) (*Resolved, error) {
 
 	r := &Resolved{
 		Raw:          p,
+		MCP:          p.MCP,
 		Workspace:    ws,
 		AllowDomains: p.AllowDomains,
 		EnvAllow:     map[string]bool{},
@@ -205,6 +226,21 @@ func Load(path string) (*Resolved, error) {
 			return nil, fmt.Errorf("exec.allow: %w", err)
 		}
 		r.ExecAllow = append(r.ExecAllow, abs)
+	}
+	policyFile, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	policyFile, err = canonical(policyFile)
+	if err != nil {
+		return nil, err
+	}
+	r.SelfProtect = append(r.SelfProtect, policyFile)
+	if err := r.validate(); err != nil {
+		return nil, err
+	}
+	if err := r.resolveMCP(); err != nil {
+		return nil, err
 	}
 	return r, nil
 }

@@ -9,3 +9,5 @@ examples/guard-audit.log
 # Прочее
 *.sb
 .DS_Store
+
+/guard-mcp-example
