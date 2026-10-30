@@ -129,3 +129,10 @@ mkdir -p examples/ws
 Нашли воспроизводимую ошибку или проблему с подключением harness? [Создайте issue](https://github.com/SpaceAI-UAG/LLM-agent-security/issues/new/choose) или изучите [правила участия](CONTRIBUTING.md#russian). Об уязвимостях сообщайте [по закрытому каналу](SECURITY.md#russian). Если проект полезен, поддержите его звездой; для уведомлений об изменениях используйте GitHub Watch.
 
 **Лицензия:** файл `LICENSE` пока не опубликован. Публичная доступность исходников сама по себе не предоставляет лицензию на использование. Условия использования и приёма изменений можно уточнить у сопровождающих проекта.
+
+Дополнительная локальная ML-проверка prompt injection и её ограничения описаны в [руководстве](docs/runtime.ru.md#локальная-оценка-prompt-injection). Она выключена по умолчанию.
+
+Для Jev / TypeSafe доступен `guard init --workspace DIR --injection-provider jev`
+и диагностический прогон `guard evaluate --policy FILE`. Он требует
+`TYPESAFE_API_KEY` и отправляет проверяемый текст во внешний API.
+Подробности: [подключение Jev](docs/runtime.ru.md#jev--typesafe-как-оценщик).

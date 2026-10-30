@@ -24,6 +24,7 @@ import (
 
 	"guard/internal/credential"
 	"guard/internal/filter"
+	"guard/internal/injection"
 	"guard/internal/policy"
 )
 
@@ -32,6 +33,7 @@ const maxBufferedBody = 8 << 20
 
 // Proxy is an HTTP server bound to loopback.
 type Proxy struct {
+	injection     *injection.Detector
 	responseSlots chan struct{}
 	mcp           http.Handler
 	allow         map[string]bool // exact host allowlist for CONNECT
@@ -157,11 +159,19 @@ func New(r *policy.Resolved, logger *log.Logger) (*Proxy, error) {
 	success := false
 	defer func() {
 		if !success {
+			p.injection.Close()
 			f.Close()
 		}
 	}()
 	if r.Limits.MaxRequests > 0 || r.Limits.RatePerMin > 0 || r.Limits.MaxRequestBytes > 0 {
 		p.lim = newLimiter(r.Limits.MaxRequests, r.Limits.RatePerMin, r.Limits.MaxRequestBytes)
+	}
+	p.injection, err = injection.New(r.PromptInjection)
+	if err != nil {
+		return nil, err
+	}
+	if r.PromptInjection.Enabled {
+		f.ProtectSecret(os.Getenv(r.PromptInjection.Defaults().TokenEnv))
 	}
 	for _, d := range r.AllowDomains {
 		p.allow[strings.ToLower(d)] = true
@@ -494,6 +504,16 @@ func (p *Proxy) filterRequest(w http.ResponseWriter, req *http.Request, jf *filt
 			d.Flagged = append(d.Flagged, sizeDecision.Flagged...)
 		}
 	}
+	if d.Action != filter.Block {
+		verdict := p.injection.Scan(req.Context(), "model_request", out)
+		p.recordInjection("model_request", verdict)
+		if verdict.Block {
+			d = filter.Decision{Action: filter.Block, Rule: verdict.Rule}
+		}
+		if verdict.Flag {
+			d.Flagged = append(d.Flagged, verdict.Rule)
+		}
+	}
 	p.filter.Record("request-body", d)
 	if err := p.filter.AuditError(); err != nil {
 		p.logger.Printf("audit write failed: %v", err)
@@ -626,6 +646,7 @@ func (p *Proxy) FilterCount() int {
 
 // CloseFilter releases the filter's audit log.
 func (p *Proxy) CloseFilter() error {
+	p.injection.Close()
 	if p.filter != nil {
 		return p.filter.Close()
 	}
@@ -657,4 +678,18 @@ func (p *Proxy) CredentialPaths() []string {
 		}
 	}
 	return paths
+}
+
+func (p *Proxy) recordInjection(source string, v injection.Decision) {
+	if v.Model == "" {
+		return
+	}
+	d := filter.Decision{Action: filter.Allow, Rule: v.Rule}
+	if v.Block {
+		d.Action = filter.Block
+	}
+	if v.Flag {
+		d.Flagged = []string{v.Rule}
+	}
+	p.filter.RecordDetail("prompt-injection:"+source, d, fmt.Sprintf("model=%s score=%.6f sha256=%s", v.Model, v.Score, v.Hash))
 }

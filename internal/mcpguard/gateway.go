@@ -17,10 +17,12 @@ import (
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"guard/internal/filter"
+	"guard/internal/injection"
 )
 
 type CommandFactory func(context.Context, string, Server) (*exec.Cmd, func(), error)
 type Gateway struct {
+	detector *injection.Detector
 	cfg      Config
 	audit    *audit
 	token    string
@@ -72,12 +74,19 @@ func New(ctx context.Context, cfg Config, content filter.Config, factory Command
 	if err != nil || !info.IsDir() || info.Mode().Perm()&0077 != 0 {
 		return nil, fmt.Errorf("MCP approval directory must be private (0700)")
 	}
+	g.detector, err = injection.New(cfg.Injection)
+	if err != nil {
+		return nil, err
+	}
 	for name, raw := range cfg.Servers {
 		s := defaults(raw)
 		content.AuditLog = ""
 		f, e := filter.New(content)
 		if e != nil {
 			return nil, e
+		}
+		if cfg.Injection.Enabled {
+			f.ProtectSecret(os.Getenv(cfg.Injection.Defaults().TokenEnv))
 		}
 		m := &managed{name: name, cfg: s, filter: f, slots: make(chan struct{}, s.MaxParallel), window: time.Now()}
 		g.servers[name] = m
@@ -225,6 +234,9 @@ func New(ctx context.Context, cfg Config, content filter.Config, factory Command
 }
 func (g *Gateway) Token() string { return g.token }
 func (g *Gateway) Close() {
+	if g != nil {
+		g.detector.Close()
+	}
 	if g == nil {
 		return
 	}
@@ -370,6 +382,7 @@ func (g *Gateway) call(m *managed, name string, tp Tool, argsFilter, resultFilte
 		if d.Action == filter.Block {
 			return reject("arguments:" + d.Rule)
 		}
+
 		if schemaValue(input, body) != nil || schemaValue(extra, body) != nil {
 			return reject("arguments_schema")
 		}
@@ -382,6 +395,20 @@ func (g *Gateway) call(m *managed, name string, tp Tool, argsFilter, resultFilte
 		}
 		if !m.admit() {
 			return reject("call_or_rate_limit")
+		}
+		if verdict := g.detector.Scan(ctx, "mcp_arguments", body); verdict.Model != "" {
+			decision := "allow"
+			if verdict.Block {
+				decision = "deny"
+			} else if verdict.Flag {
+				decision = "flag"
+			}
+			if err := g.audit.write(event{Type: "injection.scanned", ID: id, Server: m.name, Tool: name, Decision: decision, Rule: verdict.Rule, Model: verdict.Model, Score: verdict.Score, ArgumentsHash: verdict.Hash}); err != nil {
+				return nil, fmt.Errorf("MCP audit unavailable")
+			}
+			if verdict.Block {
+				return reject(verdict.Rule)
+			}
 		}
 		e := event{Type: "call.allowed", ID: id, Server: m.name, Tool: name, Decision: tp.Action, ArgumentsHash: digest(body)}
 		if err := g.audit.write(e); err != nil {
@@ -430,6 +457,22 @@ func (g *Gateway) call(m *managed, name string, tp Tool, argsFilter, resultFilte
 		cleaned, d := resultFilter.Request(encoded, m.filter)
 		if d.Action == filter.Block {
 			return reject("result:" + d.Rule)
+		}
+		verdict := g.detector.Scan(callCtx, "mcp_result", cleaned)
+		if verdict.Model != "" {
+			decision := "allow"
+			if verdict.Block {
+				decision = "deny"
+			}
+			if verdict.Flag {
+				decision = "flag"
+			}
+			if err := g.audit.write(event{Type: "injection.scanned", ID: id, Server: m.name, Tool: name, Decision: decision, Rule: verdict.Rule, Model: verdict.Model, Score: verdict.Score, ArgumentsHash: verdict.Hash}); err != nil {
+				return nil, fmt.Errorf("MCP audit unavailable")
+			}
+		}
+		if verdict.Block {
+			return reject(verdict.Rule)
 		}
 		if err := json.Unmarshal(cleaned, &result); err != nil {
 			return reject("invalid_filtered_result")

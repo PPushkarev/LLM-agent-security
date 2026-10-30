@@ -425,3 +425,8 @@ func (f *Filter) Record(direction string, d Decision) { f.audit(direction, d, ""
 
 // AuditError reports persistent audit write failures so callers can fail closed.
 func (f *Filter) AuditError() error { f.mu.Lock(); defer f.mu.Unlock(); return f.auditErr }
+
+// RecordDetail writes metadata only; callers must not include payload text.
+func (f *Filter) RecordDetail(direction string, d Decision, detail string) {
+	f.audit(direction, d, detail)
+}

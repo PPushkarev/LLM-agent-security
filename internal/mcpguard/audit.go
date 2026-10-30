@@ -9,6 +9,8 @@ import (
 )
 
 type event struct {
+	Model         string    `json:"model,omitempty"`
+	Score         float64   `json:"injection_score,omitempty"`
 	Time          time.Time `json:"time"`
 	Session       string    `json:"session"`
 	ID            string    `json:"call_id,omitempty"`

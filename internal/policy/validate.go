@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"guard/internal/filter"
+	"guard/internal/injection"
 )
 
 // canonical also resolves symlinks in existing parents of a not-yet-created path.
@@ -40,6 +41,26 @@ func contains(parent, path string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 func (r *Resolved) validate() error {
+	if err := injection.Validate(r.PromptInjection); err != nil {
+		return err
+	}
+	if r.Guardrails.RequirePromptInjection {
+		cfg := r.PromptInjection.Defaults()
+		if !cfg.Enabled || cfg.Action != "block" {
+			return fmt.Errorf("guardrails require blocking prompt injection detection")
+		}
+		for _, required := range []string{"prompt", "model_request", "mcp_result"} {
+			found := false
+			for _, source := range cfg.Sources {
+				if source == required {
+					found = true
+				}
+			}
+			if !found {
+				return fmt.Errorf("required prompt injection source missing: %s", required)
+			}
+		}
+	}
 	g := r.Guardrails
 	if g.MaxSessionSeconds < 0 || g.MaxSessionSeconds > 604800 || g.MaxOutputBytes < 0 {
 		return fmt.Errorf("invalid guardrail limits (session maximum is 7 days)")

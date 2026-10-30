@@ -142,3 +142,5 @@ See [platform behavior and limitations](docs/usage.md#limitations) for details.
 Found a reproducible bug or a harness integration gap? [Open an issue](https://github.com/SpaceAI-UAG/LLM-agent-security/issues/new/choose) or read the [contribution guide](CONTRIBUTING.md). Use the [private reporting route](SECURITY.md) for vulnerabilities. Star the repository if this work is useful, or use GitHub Watch to follow changes.
 
 **License:** no `LICENSE` file is currently published. Public source visibility does not by itself provide a reuse license. Contact the maintainers about usage and contribution terms.
+
+Optional local ML prompt-injection detection, setup and limitations are documented in the [runtime guide](docs/runtime.ru.md#локальная-оценка-prompt-injection). It is disabled by default.

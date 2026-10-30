@@ -15,6 +15,7 @@ import (
 	"guard/internal/credential"
 	"guard/internal/filter"
 	"guard/internal/guardrails"
+	"guard/internal/injection"
 	"guard/internal/mcpguard"
 	"guard/internal/policy"
 )
@@ -24,6 +25,8 @@ func initCmd(args []string) {
 	ws := fs.String("workspace", "", "directory Codex may modify")
 	output := fs.String("output", "guard.json", "new policy file (never overwritten)")
 	model := fs.String("model", "", "model ID available to your account")
+	injectionProvider := fs.String("injection-provider", "local", "оценщик: local или jev (TypeSafe API)")
+	injectionEndpoint := fs.String("injection-endpoint", "", "local semantic prompt-injection classifier endpoint")
 	exampleMCP := fs.String("mcp-example", "", "native example MCP executable (echo requires approval)")
 	authMode := fs.String("auth", "chatgpt", "chatgpt (existing Codex login) or api")
 	if err := fs.Parse(args); err != nil {
@@ -75,6 +78,13 @@ func initCmd(args []string) {
 		},
 		Limits: policy.Limits{MaxRequests: 500, RatePerMin: 60, MaxRequestBytes: 50 << 20},
 	}
+	if *injectionEndpoint != "" || *injectionProvider != "local" {
+		p.PromptInjection = injection.Config{Enabled: true, Provider: *injectionProvider, AllowRemote: *injectionProvider == "jev", Endpoint: *injectionEndpoint, RuntimeDir: filepath.Join(home, ".guard", "injection")}.Defaults()
+		p.Guardrails.RequirePromptInjection = true
+		if err := injection.Validate(p.PromptInjection); err != nil {
+			die("%v", err)
+		}
+	}
 	if *authMode == "chatgpt" {
 		p.Codex.Route = "/codex"
 		p.KeyInject = []policy.KeyInjection{{Prefix: "/codex", Upstream: "https://chatgpt.com", Auth: credential.Config{Type: "codex"}, Methods: []string{"POST"}, AllowPaths: []string{"/backend-api/codex/responses", "/backend-api/codex/responses/compact"}, JSON: filter.JSONPolicy{RequireJSON: true}}}
@@ -111,6 +121,12 @@ func initCmd(args []string) {
 		die("%v", closeErr)
 	}
 	fmt.Printf("Created %s\nWorkspace: %s\nAudit log: %s\nRun: guard codex --policy %s\n", *output, abs, p.PromptFilter.AuditLog, *output)
+	if p.PromptInjection.Provider == "jev" {
+		fmt.Println("Jev: текст после локальных фильтров будет отправляться в TypeSafe API; ключ TYPESAFE_API_KEY остаётся у guard.")
+	}
+	if !p.PromptInjection.Enabled {
+		fmt.Println("Semantic prompt injection detection: OFF (enable with --injection-endpoint)")
+	}
 }
 
 func codexCmd(args []string) {

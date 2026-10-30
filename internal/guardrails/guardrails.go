@@ -14,10 +14,11 @@ import (
 )
 
 type Config struct {
-	Strict            bool   `json:"strict"`
-	MaxSessionSeconds int    `json:"max_session_seconds"`
-	MaxOutputBytes    int64  `json:"max_output_bytes"`
-	AuditLog          string `json:"audit_log"`
+	RequirePromptInjection bool   `json:"require_prompt_injection"`
+	Strict                 bool   `json:"strict"`
+	MaxSessionSeconds      int    `json:"max_session_seconds"`
+	MaxOutputBytes         int64  `json:"max_output_bytes"`
+	AuditLog               string `json:"audit_log"`
 }
 type Session struct {
 	mu       sync.Mutex

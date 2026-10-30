@@ -11,12 +11,14 @@ import (
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"guard/internal/filter"
+	"guard/internal/injection"
 )
 
 const Prefix = "/__guard/mcp/"
 const maxBytes = 8 << 20
 
 type Config struct {
+	Injection   injection.Config  `json:"-"`
 	AuditLog    string            `json:"audit_log"`
 	ApprovalDir string            `json:"approval_dir"`
 	Servers     map[string]Server `json:"servers"`

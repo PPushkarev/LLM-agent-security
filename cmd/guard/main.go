@@ -25,6 +25,7 @@ import (
 
 	"guard/internal/filter"
 	"guard/internal/guardrails"
+	"guard/internal/injection"
 	"guard/internal/mcpguard"
 	"guard/internal/policy"
 	"guard/internal/proxy"
@@ -36,6 +37,8 @@ func main() {
 		usage()
 	}
 	switch os.Args[1] {
+	case "evaluate":
+		evaluateCmd(os.Args[2:])
 	case "mcp":
 		mcpCmd(os.Args[2:])
 	case "check":
@@ -59,10 +62,11 @@ func usage() {
 	fmt.Fprint(os.Stderr, `guard — sandbox any agent harness
 
 usage:
+  guard evaluate --policy FILE
   guard mcp pending|approve|deny --policy FILE [--id ID]
   guard mcp bridge --server NAME  (inside guard run; uses GUARD_MCP_CONFIG)
   guard check   --policy FILE         validate policy and backend
-  guard init    --workspace DIR [--output guard.json] [--auth chatgpt|api] [--model MODEL]
+  guard init    --workspace DIR [--output guard.json] [--auth chatgpt|api] [--model MODEL] [--injection-endpoint URL] [--injection-provider local|jev]
   guard codex   --policy FILE [--dry-run] -- [CODEX ARGS...]
   guard run     --policy FILE [--dry-run] -- HARNESS [ARGS...]
   guard submit  --policy FILE [--prompt TEXT] [-- HARNESS ARGS...]
@@ -148,7 +152,35 @@ func submitCmd(args []string) {
 		die("filter: %v", err)
 	}
 	defer f.Close()
+	if r.PromptInjection.Enabled {
+		f.ProtectSecret(os.Getenv(r.PromptInjection.Defaults().TokenEnv))
+	}
 	cleaned, d := f.Request(prompt)
+	if d.Action != filter.Block {
+		detector, e := injection.New(r.PromptInjection)
+		if e != nil {
+			die("%v", e)
+		}
+		defer detector.Close()
+		verdict := detector.Scan(context.Background(), "prompt", cleaned)
+		if verdict.Model != "" {
+			decision := filter.Decision{Action: filter.Allow, Rule: verdict.Rule}
+			if verdict.Block {
+				decision.Action = filter.Block
+			}
+			if verdict.Flag {
+				decision.Flagged = []string{verdict.Rule}
+			}
+			f.RecordDetail("prompt-injection:prompt", decision, fmt.Sprintf("model=%s score=%.6f sha256=%s", verdict.Model, verdict.Score, verdict.Hash))
+		}
+		if verdict.Block {
+			d = filter.Decision{Action: filter.Block, Rule: verdict.Rule}
+		}
+		if verdict.Flag {
+			d.Flagged = append(d.Flagged, verdict.Rule)
+		}
+	}
+
 	if err := f.AuditError(); err != nil {
 		die("audit write failed: %v", err)
 	}
@@ -266,6 +298,7 @@ func runLaunch(r *policy.Resolved, dryRun bool, argv []string, stdin io.Reader, 
 	}
 	r.Writable = append(r.Writable, scratch)
 	extraEnv := []string{"TMPDIR=" + scratch}
+	r.MCP.Injection = r.PromptInjection
 	var gatewayToken string
 	{
 		if len(r.MCP.Servers) > 0 {
