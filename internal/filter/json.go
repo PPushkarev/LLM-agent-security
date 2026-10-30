@@ -163,12 +163,18 @@ func readJSONValue(dec *json.Decoder, depth int) (any, error) {
 // Request applies route restrictions first, then scans decoded JSON strings.
 // Unchanged requests retain their original bytes, including in monitor mode.
 func (j *JSONFilter) Request(body []byte, f *Filter) ([]byte, Decision) {
+	return j.apply(body, f.Request)
+}
+func (j *JSONFilter) Response(body []byte, f *Filter) ([]byte, Decision) {
+	return j.apply(body, f.ResponseText)
+}
+func (j *JSONFilter) apply(body []byte, inspect func([]byte) ([]byte, Decision)) ([]byte, Decision) {
 	v, err := decodeJSON(body)
 	if err != nil {
 		if j.cfg.RequireJSON || len(j.cfg.AllowModels) > 0 || len(j.cfg.DenyFields) > 0 || len(j.rules) > 0 {
 			return body, Decision{Action: Block, Rule: "invalid_json"}
 		}
-		return f.Request(body)
+		return inspect(body)
 	}
 	if len(j.cfg.AllowModels) > 0 {
 		obj, ok := v.(map[string]any)
@@ -228,7 +234,7 @@ func (j *JSONFilter) Request(body []byte, f *Filter) ([]byte, Decision) {
 		switch x := value.(type) {
 		case string:
 			// Global content policy scans decoded strings, before route redaction.
-			out, d := f.Request([]byte(x))
+			out, d := inspect([]byte(x))
 			mergeDecision(&total, d)
 			if total.Action == Block {
 				return value
@@ -247,7 +253,7 @@ func (j *JSONFilter) Request(body []byte, f *Filter) ([]byte, Decision) {
 			}
 			sort.Strings(keys)
 			for _, k := range keys {
-				_, d := f.Request([]byte(k))
+				_, d := inspect([]byte(k))
 				if d.Action == Redact {
 					d.Action = Block
 					d.Rule = "redaction_in_json_key"
@@ -289,3 +295,6 @@ func mergeDecision(dst *Decision, src Decision) {
 		dst.Count += src.Count
 	}
 }
+
+// DecodeJSON rejects duplicate keys, trailing documents and excessive nesting.
+func DecodeJSON(body []byte) (any, error) { return decodeJSON(body) }

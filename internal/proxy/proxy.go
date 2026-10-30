@@ -32,6 +32,7 @@ const maxBufferedBody = 8 << 20
 
 // Proxy is an HTTP server bound to loopback.
 type Proxy struct {
+	responseSlots chan struct{}
 	mcp           http.Handler
 	allow         map[string]bool // exact host allowlist for CONNECT
 	routes        []route         // key-injection reverse routes
@@ -152,7 +153,7 @@ func New(r *policy.Resolved, logger *log.Logger) (*Proxy, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &Proxy{allow: map[string]bool{}, filter: f, logger: logger, maxFilterBody: r.PromptFilter.MaxBodyBytes}
+	p := &Proxy{responseSlots: make(chan struct{}, 4), allow: map[string]bool{}, filter: f, logger: logger, maxFilterBody: r.PromptFilter.MaxBodyBytes}
 	success := false
 	defer func() {
 		if !success {
@@ -242,6 +243,9 @@ func New(r *policy.Resolved, logger *log.Logger) (*Proxy, error) {
 				}
 				if val != "" {
 					req.Header.Set(hdr, val)
+				}
+				if p.filter.ScanResponses() {
+					req.Header.Set("Accept-Encoding", "identity")
 				}
 				if headers, ok := req.Context().Value(credentialHeadersKey{}).(http.Header); ok {
 					for k, v := range headers {
@@ -611,49 +615,6 @@ func (p *Proxy) filterURL(w http.ResponseWriter, req *http.Request, prefix strin
 		req.URL.RawQuery = newQuery
 	}
 	return true
-}
-
-// scanResponse is the ReverseProxy ModifyResponse hook: it inspects model
-// output and, on a blocking match, swaps the body for an error so injected
-// instructions never reach the harness. Streaming responses (SSE) are passed
-// through unscanned — buffering a stream would break token-by-token output.
-func (p *Proxy) scanResponse(resp *http.Response) error {
-	if p.filter == nil || !p.filter.ScanResponses() {
-		return nil
-	}
-	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
-		return nil
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBufferedBody+1))
-	resp.Body.Close()
-	if err != nil {
-		return err
-	}
-	if len(body) > maxBufferedBody {
-		return fmt.Errorf("response body exceeds buffering limit")
-	}
-	_, d := p.filter.Response(body)
-	if err := p.filter.AuditError(); err != nil {
-		return fmt.Errorf("audit write failed: %w", err)
-	}
-	if len(d.Flagged) > 0 {
-		p.logger.Printf("FILTER FLAG response rules=%s (output forwarded unchanged)", strings.Join(d.Flagged, ","))
-	}
-	if d.Action == filter.Block {
-		p.mu.Lock()
-		p.filterCount++
-		p.mu.Unlock()
-		p.logger.Printf("FILTER BLOCK response rule=%s", d.Rule)
-		msg := []byte(`{"error":"guard prompt filter blocked model output: ` + d.Rule + `"}`)
-		resp.Body = io.NopCloser(bytes.NewReader(msg))
-		resp.ContentLength = int64(len(msg))
-		resp.Header.Set("Content-Length", strconv.Itoa(len(msg)))
-		resp.StatusCode = http.StatusForbidden
-		resp.Status = "403 Forbidden"
-		return nil
-	}
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	return nil
 }
 
 // FilterCount reports how many requests/responses the content firewall acted on.

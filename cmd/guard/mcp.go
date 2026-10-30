@@ -60,7 +60,7 @@ func mcpCommandFactory(parent *policy.Resolved) mcpguard.CommandFactory {
 				return nil, nil, err
 			}
 		}
-		r := &policy.Resolved{Workspace: parent.Workspace, Writable: append([]string{runtimeDir}, s.Sandbox.Writable...), ReadAllow: append([]string{runtimeDir, s.Command[0], "/System", "/usr", "/bin", "/sbin", "/Library/Developer", "/Library/Apple/System/Library", "/dev", "/private/etc", "/private/var/db/dyld"}, s.Sandbox.ReadAllow...), ReadDeny: append([]string(nil), parent.ReadDeny...), SelfProtect: append([]string(nil), parent.SelfProtect...), EnvAllow: map[string]bool{}, ExecDeny: parent.ExecDeny, ExecAllow: parent.ExecAllow}
+		r := &policy.Resolved{Workspace: parent.Workspace, Writable: append([]string{runtimeDir}, s.Sandbox.Writable...), ReadAllow: append([]string{runtimeDir, s.Command[0], "/System", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/Library/Developer", "/Library/Apple/System/Library", "/dev", "/private/etc", "/private/var/db/dyld"}, s.Sandbox.ReadAllow...), ReadDeny: append([]string(nil), parent.ReadDeny...), SelfProtect: append([]string(nil), parent.SelfProtect...), EnvAllow: map[string]bool{}, ExecDeny: parent.ExecDeny, ExecAllow: parent.ExecAllow}
 		env := []string{"HOME=" + home, "TMPDIR=" + tmp, "PATH=/usr/bin:/bin:/usr/sbin:/sbin"}
 		extra := []string{}
 		for _, name := range s.EnvAllow {
@@ -104,7 +104,12 @@ func mcpCommandFactory(parent *policy.Resolved) mcpguard.CommandFactory {
 		if err := os.WriteFile(path, []byte(profile), 0600); err != nil {
 			return nil, nil, err
 		}
-		cmd := buildCommand(r, path, env, s.Command)
+		cmd, commandCleanup, err := buildCommand(r, path, env, s.Command)
+		if err != nil {
+			return nil, nil, err
+		}
+		previousCleanup := cleanup
+		cleanup = func() { commandCleanup(); previousCleanup() }
 		cmd.Dir = parent.Workspace
 		cmd.Stderr = io.Discard // server stderr may contain credentials
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

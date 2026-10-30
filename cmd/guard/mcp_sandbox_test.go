@@ -1,5 +1,3 @@
-//go:build darwin
-
 package main
 
 import (
@@ -10,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -43,6 +42,9 @@ func TestMCPFixtureProcess(t *testing.T) {
 	os.Exit(0)
 }
 func TestLocalMCPSandbox(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("OS sandbox")
+	}
 	root := t.TempDir()
 	root, _ = filepath.EvalSymlinks(root)
 	ws := filepath.Join(root, "workspace")

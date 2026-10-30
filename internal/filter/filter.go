@@ -15,7 +15,9 @@
 package filter
 
 import (
+	"encoding/json"
 	"fmt"
+	"github.com/google/jsonschema-go/jsonschema"
 	"net/url"
 	"os"
 	"regexp"
@@ -60,14 +62,20 @@ type Config struct {
 	// Mode: "enforce" (default) applies each rule's action; "monitor" never
 	// blocks and never alters a prompt — it only logs what WOULD have happened,
 	// so you can tune rules without silently changing anyone's prompt.
-	Mode          string   `json:"mode"`
-	MaxBodyBytes  int      `json:"max_body_bytes"`
-	Block         []Rule   `json:"block"`          // default action: block
-	Redact        []Rule   `json:"redact"`         // default action: redact (silent rewrite)
-	LiteralRedact []string `json:"literal_redact"` // exact strings always scrubbed
-	ScanResponses bool     `json:"scan_responses"`
-	ResponseBlock []Rule   `json:"response_block"` // model output matching these is refused
-	AuditLog      string   `json:"audit_log"`      // path (guard-writable, outside the sandbox)
+	Mode               string          `json:"mode"`
+	MaxBodyBytes       int             `json:"max_body_bytes"`
+	Block              []Rule          `json:"block"`          // default action: block
+	Redact             []Rule          `json:"redact"`         // default action: redact (silent rewrite)
+	LiteralRedact      []string        `json:"literal_redact"` // exact strings always scrubbed
+	ScanResponses      bool            `json:"scan_responses"`
+	ResponseRules      []Rule          `json:"response_rules"`
+	ResponseJSON       JSONPolicy      `json:"response_json"`
+	ResponseSchema     json.RawMessage `json:"response_schema,omitempty"`
+	ResponseSchemaPath string          `json:"response_schema_path"`
+	ResponseMaxBytes   int             `json:"response_max_bytes"`
+	ResponseTimeoutSec int             `json:"response_timeout_sec"`
+	ResponseBlock      []Rule          `json:"response_block"` // model output matching these is refused
+	AuditLog           string          `json:"audit_log"`      // path (guard-writable, outside the sandbox)
 }
 
 func (c Config) monitor() bool { return strings.EqualFold(c.Mode, "monitor") }
@@ -89,13 +97,15 @@ type compiledRule struct {
 
 // Filter is the compiled, ready-to-use firewall.
 type Filter struct {
-	cfg       Config
-	reqRules  []compiledRule // block + redact + flag rules, in order
-	literals  []string
-	respBlock []compiledRule
-	mu        sync.Mutex
-	auditFile *os.File
-	auditErr  error
+	cfg            Config
+	reqRules       []compiledRule // block + redact + flag rules, in order
+	literals       []string
+	responseJSON   *JSONFilter
+	responseSchema *jsonschema.Resolved
+	respBlock      []compiledRule
+	mu             sync.Mutex
+	auditFile      *os.File
+	auditErr       error
 }
 
 // ParseAction maps policy actions to outcomes. Empty/unknown values use def;
@@ -147,6 +157,12 @@ func New(cfg Config) (*Filter, error) {
 	if cfg.Mode != "" && cfg.Mode != "enforce" && cfg.Mode != "monitor" {
 		return nil, fmt.Errorf("invalid filter mode %q", cfg.Mode)
 	}
+	if len(cfg.ResponseSchema) > 256<<10 {
+		return nil, fmt.Errorf("response_schema exceeds 256 KiB")
+	}
+	if cfg.ResponseMaxBytes < 0 || cfg.ResponseMaxBytes > 8<<20 || cfg.ResponseTimeoutSec < 0 || cfg.ResponseTimeoutSec > 600 {
+		return nil, fmt.Errorf("response limits must be 0..8 MiB and 0..600 seconds")
+	}
 	if cfg.MaxBodyBytes < 0 {
 		return nil, fmt.Errorf("max_body_bytes must not be negative")
 	}
@@ -165,7 +181,13 @@ func New(cfg Config) (*Filter, error) {
 		return nil, err
 	}
 	f.reqRules = append(blockRules, redactRules...)
-	if f.respBlock, err = compile(cfg.ResponseBlock, Block); err != nil {
+	if f.respBlock, err = compile(append(append(append([]Rule{}, builtinBlock...), cfg.ResponseBlock...), cfg.ResponseRules...), Block); err != nil {
+		return nil, err
+	}
+	if f.responseJSON, err = NewJSON(cfg.ResponseJSON); err != nil {
+		return nil, err
+	}
+	if f.responseSchema, err = compileResponseSchema(cfg.ResponseSchema, cfg.ResponseSchemaPath); err != nil {
 		return nil, err
 	}
 	if cfg.AuditLog != "" {
@@ -280,10 +302,13 @@ func (f *Filter) URL(rawPath, rawQuery string) (string, Decision) {
 
 // scan is the shared rule-evaluation core used by both body and URL inspection.
 func (f *Filter) scan(label string, data []byte) ([]byte, Decision) {
+	return f.scanRules(label, data, f.reqRules)
+}
+func (f *Filter) scanRules(label string, data []byte, rules []compiledRule) ([]byte, Decision) {
 	mon := f.cfg.monitor()
 	var flagged []string
 	var redactRules []compiledRule
-	for _, r := range f.reqRules {
+	for _, r := range rules {
 		if !r.re.Match(data) {
 			continue
 		}
@@ -320,7 +345,9 @@ func (f *Filter) scan(label string, data []byte) ([]byte, Decision) {
 		d.Count = count
 		d.Rule = redactNames(redactRules)
 	}
-	f.audit(label, d, "")
+	if label != "response" || d.Action != Allow || len(d.Flagged) > 0 {
+		f.audit(label, d, "")
+	}
 	return out, d
 }
 
@@ -332,29 +359,6 @@ func (f *Filter) matchingRedactRules(data []byte) []compiledRule {
 		}
 	}
 	return out
-}
-
-// Response inspects model output. In monitor mode it never blocks; it records a
-// would-block instead.
-func (f *Filter) Response(body []byte) ([]byte, Decision) {
-	if !f.ScanResponses() {
-		return body, Decision{Action: Allow}
-	}
-	mon := f.cfg.monitor()
-	for _, r := range f.respBlock {
-		if r.re.Match(body) {
-			if mon {
-				d := Decision{Action: Allow, Monitored: true, Flagged: []string{"would-block:" + r.name}}
-				f.audit("response", d, "injection/forbidden content in model output")
-				return body, d
-			}
-			d := Decision{Action: Block, Rule: r.name}
-			f.audit("response", d, "injection/forbidden content in model output")
-			return body, d
-		}
-	}
-	f.audit("response", Decision{Action: Allow}, "")
-	return body, Decision{Action: Allow}
 }
 
 func (f *Filter) applyRedactions(body []byte, rules []compiledRule) ([]byte, int) {
@@ -412,6 +416,7 @@ func (f *Filter) Close() error {
 func (f *Filter) ProtectSecret(value string) {
 	if value != "" && f.Enabled() {
 		f.reqRules = append([]compiledRule{{name: "proxy_credential", re: regexp.MustCompile(regexp.QuoteMeta(value)), action: Block}}, f.reqRules...)
+		f.respBlock = append([]compiledRule{{name: "proxy_credential", re: regexp.MustCompile(regexp.QuoteMeta(value)), action: Block}}, f.respBlock...)
 	}
 }
 

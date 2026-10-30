@@ -21,8 +21,10 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"guard/internal/filter"
+	"guard/internal/guardrails"
 	"guard/internal/mcpguard"
 	"guard/internal/policy"
 	"guard/internal/proxy"
@@ -222,7 +224,7 @@ func finishLaunch(err error) {
 	}
 	die("%v", err)
 }
-func runLaunch(r *policy.Resolved, dryRun bool, argv []string, stdin io.Reader, codex bool) error {
+func runLaunch(r *policy.Resolved, dryRun bool, argv []string, stdin io.Reader, codex bool) (resultErr error) {
 	logger := log.New(os.Stderr, "\x1b[2m[guard]\x1b[0m ", 0)
 
 	// 1. Start the egress proxy in the trusted parent (secrets live here only).
@@ -333,14 +335,39 @@ func runLaunch(r *policy.Resolved, dryRun bool, argv []string, stdin io.Reader, 
 		return nil
 	}
 
-	// 4. Launch the harness under the sandbox.
-	cmd := buildCommand(r, profPath, env, argv)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, os.Stdout, os.Stderr
+	// 4. Launch with harness-independent session guardrails.
+	session, err := guardrails.New(r.Guardrails)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if e := session.Close(); e != nil && resultErr == nil {
+			resultErr = e
+		}
+	}()
+
+	cmd, commandCleanup, err := buildCommand(r, profPath, env, argv)
+	if err != nil {
+		return err
+	}
+	defer commandCleanup()
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = 2 * time.Second
 
 	cmd.Dir = r.Workspace
-	if err := cmd.Start(); err != nil {
+	terminalCleanup, err := startHarness(cmd, stdin, session, func(device string) error {
+		r.TerminalDevice = device
+		profile, err := sandbox.Profile(r)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(profPath, []byte(profile), 0600)
+	})
+	if err != nil {
 		return fmt.Errorf("start harness: %w", err)
 	}
+	defer terminalCleanup()
+	session.Start()
 	sig := make(chan os.Signal, 1)
 	done := make(chan struct{})
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -349,14 +376,34 @@ func runLaunch(r *policy.Resolved, dryRun bool, argv []string, stdin io.Reader, 
 	go func() {
 		for {
 			select {
+			case <-session.Violated():
+				// A shell can be in fork while the first group signal is delivered.
+				// Keep terminating the group until Wait drains inherited output pipes.
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				_ = cmd.Process.Kill()
+				ticker := time.NewTicker(10 * time.Millisecond)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-done:
+						return
+					case <-ticker.C:
+						_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+					}
+				}
+
 			case s := <-sig:
-				_ = cmd.Process.Signal(s)
+				_ = syscall.Kill(-cmd.Process.Pid, s.(syscall.Signal))
 			case <-done:
 				return
 			}
 		}
 	}()
 	err = cmd.Wait()
+	terminalCleanup()
+	if guardErr := session.Err(); guardErr != nil {
+		return guardErr
+	}
 	logger.Printf("egress denials: %d · prompt-filter actions: %d · throttled: %d", px.DenyCount(), px.FilterCount(), px.LimitCount())
 	return err
 }

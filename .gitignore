@@ -11,3 +11,5 @@ examples/guard-audit.log
 .DS_Store
 
 /guard-mcp-example
+
+/dist/

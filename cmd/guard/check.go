@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 
 	"guard/internal/policy"
 	"guard/internal/sandbox"
@@ -23,6 +24,8 @@ func checkCmd(args []string) {
 	for _, rt := range r.KeyInject {
 		fmt.Printf("  %s -> %s methods=%v paths=%v models=%v JSON rules=%d\n", rt.Prefix, rt.Upstream, rt.Methods, rt.AllowPaths, rt.JSON.AllowModels, len(rt.JSON.Rules))
 	}
+	fmt.Printf("Model response gate: enabled=%t rules=%d JSON rules=%d schema=%t\n", r.PromptFilter.ScanResponses, len(r.PromptFilter.ResponseRules)+len(r.PromptFilter.ResponseBlock), len(r.PromptFilter.ResponseJSON.Rules), len(r.PromptFilter.ResponseSchema) > 0 && strings.TrimSpace(string(r.PromptFilter.ResponseSchema)) != "null")
+	fmt.Printf("Guardrails: strict=%t max_session_seconds=%d max_output_bytes=%d session_audit=%t\n", r.Guardrails.Strict, r.Guardrails.MaxSessionSeconds, r.Guardrails.MaxOutputBytes, r.Guardrails.AuditLog != "")
 	fmt.Printf("Managed MCP servers: %d\n", len(r.MCP.Servers))
 	fmt.Println("Credentials and API availability are checked when starting a session.")
 }

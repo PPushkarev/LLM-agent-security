@@ -29,7 +29,7 @@ This repository publishes a **focused prototype from the SpaceAI initiative**. S
 
 | Control | Implementation | Practical value |
 | --- | --- | --- |
-| OS sandbox | macOS Seatbelt; Linux launch disabled pending network isolation | Apply boundaries to the harness and its child processes |
+| OS sandbox | macOS Seatbelt; Linux bubblewrap + isolated proxy bridge + seccomp | Apply boundaries to the harness and its child processes |
 | Filesystem policy | Writable paths, denied reads and protected persistence paths | Reduce unwanted access and changes |
 | Controlled egress | Domain allowlist and reverse-proxy routes | Make outbound destinations explicit |
 | API key injection | Parent proxy adds a configured upstream auth header | Keep provider keys out of the child environment with a correctly configured policy |
@@ -50,7 +50,7 @@ Claude Code, Codex, Hermes and custom CLI harnesses are example integration targ
 <a id="quick-start"></a>
 ## Quick start
 
-Requires **Go 1.26+**. Input filtering needs no LLM account or sandboxed harness. Actual sandbox execution requires macOS with `sandbox-exec`; Linux execution currently fails closed pending network isolation.
+Requires **Go 1.26+**. Input filtering needs no LLM account or sandboxed harness. Sandbox execution supports macOS with `sandbox-exec`, or Linux amd64/arm64 with bubblewrap, user namespaces and seccomp.
 
 ```sh
 git clone https://github.com/SpaceAI-UAG/LLM-agent-security.git
@@ -79,7 +79,9 @@ This is a synthetic marker, not a real secret. The enabled filter detects the pr
 
 The current implementation adds `init`, `check`, `codex` and `mcp` commands,
 ChatGPT subscription authentication through the trusted parent, structured JSON
-filters and harness-independent MCP controls. The [current runtime guide
+filters, harness-independent MCP controls, and a `guardrails` policy section for
+strict configuration, session time/output budgets and session audit. New policies
+enable strict guardrails by default. The [current runtime guide
 (Russian)](docs/runtime.ru.md) describes the full configuration and boundaries.
 
 ```sh
@@ -111,8 +113,8 @@ Controls apply around the harness and its children. Managed MCP servers addition
 ## Current boundaries
 
 - **Prototype:** use a disposable environment. No independent security audit or certification is claimed.
-- **Backend differences:** macOS restricts network access to the guard proxy port. Linux execution fails closed because its network namespace has no bridge to the parent proxy. Windows is unsupported.
-- **Inspection scope:** configured reverse-proxy routes are inspected; encrypted HTTPS `CONNECT` payloads and streaming SSE responses are not. Regex rules do not provide complete prompt-injection or data-loss prevention.
+- **Backend differences:** macOS restricts network access to the guard proxy port. Linux uses a private network namespace and an inherited proxy bridge; host Unix sockets and namespace-changing syscalls are blocked. `exec.allow` additionally requires Landlock. Windows is unsupported.
+- **Inspection scope:** configured reverse-proxy routes are inspected; encrypted HTTPS `CONNECT` payloads are not. With `scan_responses`, JSON and supported SSE model responses are buffered and checked before delivery. Regex rules do not provide complete prompt-injection or data-loss prevention.
 - **Policy matters:** filesystem reads are broadly allowed except configured exclusions. Review writable paths, environment passthrough, local services and audit-log placement.
 
 See [platform behavior and limitations](docs/usage.md#limitations) for details.

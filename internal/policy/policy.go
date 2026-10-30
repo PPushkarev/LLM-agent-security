@@ -14,6 +14,7 @@ import (
 
 	"guard/internal/credential"
 	"guard/internal/filter"
+	"guard/internal/guardrails"
 	"guard/internal/mcpguard"
 )
 
@@ -71,19 +72,20 @@ type Codex struct {
 }
 
 type Policy struct {
-	MCP          mcpguard.Config `json:"mcp"`
-	Codex        Codex           `json:"codex"`
-	Workspace    string          `json:"workspace"`     // the one directory the agent may write in
-	Writable     []string        `json:"writable"`      // extra writable paths
-	ReadDeny     []string        `json:"read_deny"`     // paths the agent may not read (secrets)
-	SelfProtect  []string        `json:"self_protect"`  // paths inside writable the agent may NOT write (persistence)
-	AllowDomains []string        `json:"allow_domains"` // domains reachable through the proxy
-	EnvAllow     []string        `json:"env_allow"`     // env var names passed through verbatim
-	ProxyPort    int             `json:"proxy_port"`    // 0 = auto-assign
-	KeyInject    []KeyInjection  `json:"key_injection"`
-	PromptFilter filter.Config   `json:"prompt_filter"` // content firewall on LLM traffic
-	Exec         ExecPolicy      `json:"exec"`          // which executables the agent may run
-	Limits       Limits          `json:"limits"`        // rate / budget caps on egress
+	Guardrails   guardrails.Config `json:"guardrails"`
+	MCP          mcpguard.Config   `json:"mcp"`
+	Codex        Codex             `json:"codex"`
+	Workspace    string            `json:"workspace"`     // the one directory the agent may write in
+	Writable     []string          `json:"writable"`      // extra writable paths
+	ReadDeny     []string          `json:"read_deny"`     // paths the agent may not read (secrets)
+	SelfProtect  []string          `json:"self_protect"`  // paths inside writable the agent may NOT write (persistence)
+	AllowDomains []string          `json:"allow_domains"` // domains reachable through the proxy
+	EnvAllow     []string          `json:"env_allow"`     // env var names passed through verbatim
+	ProxyPort    int               `json:"proxy_port"`    // 0 = auto-assign
+	KeyInject    []KeyInjection    `json:"key_injection"`
+	PromptFilter filter.Config     `json:"prompt_filter"` // content firewall on LLM traffic
+	Exec         ExecPolicy        `json:"exec"`          // which executables the agent may run
+	Limits       Limits            `json:"limits"`        // rate / budget caps on egress
 }
 
 // Limits caps how much the agent can send out this session, so even permitted
@@ -107,21 +109,23 @@ type ExecPolicy struct {
 // Resolved is Policy with ~ and relative paths expanded to absolute paths, and
 // with self-protected paths resolved relative to the workspace.
 type Resolved struct {
-	MCP          mcpguard.Config
-	ReadAllow    []string // optional read allowlist used for managed MCP processes
-	Raw          Policy
-	Workspace    string
-	Writable     []string // absolute, includes Workspace
-	ReadDeny     []string // absolute
-	SelfProtect  []string // absolute, under Workspace
-	AllowDomains []string
-	EnvAllow     map[string]bool
-	ProxyPort    int
-	KeyInject    []KeyInjection
-	PromptFilter filter.Config
-	ExecDeny     []string // absolute executable paths
-	ExecAllow    []string // absolute executable paths (allowlist mode when non-empty)
-	Limits       Limits
+	TerminalDevice string // per-launch PTY, chosen by the trusted parent
+	Guardrails     guardrails.Config
+	MCP            mcpguard.Config
+	ReadAllow      []string // optional read allowlist used for managed MCP processes
+	Raw            Policy
+	Workspace      string
+	Writable       []string // absolute, includes Workspace
+	ReadDeny       []string // absolute
+	SelfProtect    []string // absolute, under Workspace
+	AllowDomains   []string
+	EnvAllow       map[string]bool
+	ProxyPort      int
+	KeyInject      []KeyInjection
+	PromptFilter   filter.Config
+	ExecDeny       []string // absolute executable paths
+	ExecAllow      []string // absolute executable paths (allowlist mode when non-empty)
+	Limits         Limits
 }
 
 func expand(home, base, p string) (string, error) {
@@ -169,6 +173,7 @@ func Load(path string) (*Resolved, error) {
 
 	r := &Resolved{
 		Raw:          p,
+		Guardrails:   p.Guardrails,
 		MCP:          p.MCP,
 		Workspace:    ws,
 		AllowDomains: p.AllowDomains,
@@ -186,6 +191,13 @@ func Load(path string) (*Resolved, error) {
 			return nil, fmt.Errorf("prompt_filter.audit_log: %w", err)
 		}
 		r.PromptFilter.AuditLog = abs
+	}
+	if p.Guardrails.AuditLog != "" {
+		abs, err := expand(home, cwd, p.Guardrails.AuditLog)
+		if err != nil {
+			return nil, err
+		}
+		r.Guardrails.AuditLog = abs
 	}
 	r.Writable = append(r.Writable, ws)
 	for _, w := range p.Writable {
@@ -241,6 +253,16 @@ func Load(path string) (*Resolved, error) {
 	}
 	if err := r.resolveMCP(); err != nil {
 		return nil, err
+	}
+	if r.Guardrails.Strict {
+		for name, server := range r.MCP.Servers {
+			if len(server.Sandbox.AllowDomains) > 0 {
+				return nil, fmt.Errorf("strict guardrails prohibit raw egress from local MCP server %s", name)
+			}
+		}
+	}
+	if len(r.MCP.Servers) > 0 && r.Guardrails.AuditLog != "" && r.MCP.AuditLog == r.Guardrails.AuditLog {
+		return nil, fmt.Errorf("MCP and guardrail audit logs must differ")
 	}
 	return r, nil
 }
