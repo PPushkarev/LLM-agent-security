@@ -88,8 +88,8 @@ func TestGenericHarnessProcess(t *testing.T) {
 	os.Exit(0)
 }
 func TestGenericHarnessManagedMCP(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("Seatbelt integration")
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("OS sandbox integration")
 	}
 	for _, mode := range []string{"http", "stdio"} {
 		t.Run(mode, func(t *testing.T) {

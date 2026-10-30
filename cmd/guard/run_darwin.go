@@ -9,6 +9,6 @@ import (
 	"guard/internal/sandbox"
 )
 
-func buildCommand(_ *policy.Resolved, profPath string, env []string, argv []string) *exec.Cmd {
-	return sandbox.Command(profPath, env, argv)
+func buildCommand(_ *policy.Resolved, profPath string, env []string, argv []string) (*exec.Cmd, func(), error) {
+	return sandbox.Command(profPath, env, argv), func() {}, nil
 }

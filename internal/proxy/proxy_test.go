@@ -75,9 +75,10 @@ func TestBodyBufferLimits(t *testing.T) {
 	if err := p.scanResponse(resp); err == nil {
 		t.Fatal("oversized response admitted")
 	}
-	// SSE remains streamed rather than buffered.
+	// SSE is also bounded before any model output is released.
 	resp.Header.Set("Content-Type", "text/event-stream")
-	if err := p.scanResponse(resp); err != nil {
+	resp.Body = io.NopCloser(io.LimitReader(zeroReader{}, maxBufferedBody+100))
+	if err := p.scanResponse(resp); err == nil {
 		t.Fatal(err)
 	}
 }

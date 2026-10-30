@@ -17,6 +17,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"guard/internal/filter"
+	"guard/internal/injection"
 	"guard/internal/mcpguard"
 	"guard/internal/policy"
 )
@@ -67,7 +68,24 @@ func TestCodexManagedMCPEndToEnd(t *testing.T) {
 	if err := os.Mkdir(ws, 0700); err != nil {
 		t.Fatal(err)
 	}
-	r := &policy.Resolved{Workspace: ws, Writable: []string{ws}, EnvAllow: map[string]bool{"PATH": true}, Raw: policy.Policy{Codex: policy.Codex{Model: "guard-test", Route: "/openai"}}, KeyInject: []policy.KeyInjection{{Prefix: "/openai", Upstream: api.URL, Methods: []string{"POST"}, AllowPaths: []string{"/v1/responses"}, JSON: filter.JSONPolicy{RequireJSON: true}}}, PromptFilter: filter.Config{Enabled: true, Redact: []filter.Rule{{Name: "email", Pattern: `[A-Za-z]+@[A-Za-z]+\.[A-Za-z]+`, Action: "redact"}}}, MCP: mcpguard.Config{AuditLog: filepath.Join(root, "mcp.jsonl"), ApprovalDir: filepath.Join(root, "approvals"), Servers: map[string]mcpguard.Server{"fixture": {URL: remote.URL, AllowHTTP: true, Tools: map[string]mcpguard.Tool{"echo": {Action: "allow"}}}}}}
+	r := &policy.Resolved{Workspace: ws, Writable: []string{ws}, EnvAllow: map[string]bool{"PATH": true}, Raw: policy.Policy{Codex: policy.Codex{Model: "guard-test", Route: "/openai"}}, KeyInject: []policy.KeyInjection{{Prefix: "/openai", Upstream: api.URL, Methods: []string{"POST"}, AllowPaths: []string{"/v1/responses"}, JSON: filter.JSONPolicy{RequireJSON: true}}}, PromptFilter: filter.Config{Enabled: true, ScanResponses: true, Redact: []filter.Rule{{Name: "email", Pattern: `[A-Za-z]+@[A-Za-z]+\.[A-Za-z]+`, Action: "redact"}}}, MCP: mcpguard.Config{AuditLog: filepath.Join(root, "mcp.jsonl"), ApprovalDir: filepath.Join(root, "approvals"), Servers: map[string]mcpguard.Server{"fixture": {URL: remote.URL, AllowHTTP: true, Tools: map[string]mcpguard.Tool{"echo": {Action: "allow"}}}}}}
+	if endpoint := os.Getenv("GUARD_INJECTION_E2E_ENDPOINT"); endpoint != "" {
+		r.PromptInjection = injection.Config{Enabled: true, Endpoint: endpoint, Action: os.Getenv("GUARD_INJECTION_E2E_ACTION")}
+		r.PromptFilter.AuditLog = filepath.Join(root, "injection.audit")
+		t.Cleanup(func() {
+			if t.Failed() {
+				for _, path := range []string{r.PromptFilter.AuditLog, r.MCP.AuditLog} {
+					if b, err := os.ReadFile(path); err == nil {
+						for _, line := range strings.Split(string(b), "\n") {
+							if strings.Contains(line, "prompt-injection:") || strings.Contains(line, "injection.scanned") {
+								t.Logf("classifier audit: %s", line)
+							}
+						}
+					}
+				}
+			}
+		})
+	}
 	if err := runLaunch(r, false, []string{"exec", "--skip-git-repo-check", "--ephemeral", "Use the fixture MCP echo tool once, then answer GUARD_MCP_OK. Do not run shell commands."}, strings.NewReader(""), true); err != nil {
 		t.Fatal(err)
 	}

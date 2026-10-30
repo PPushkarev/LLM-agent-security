@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"guard/internal/filter"
+	"guard/internal/injection"
 )
 
 // canonical also resolves symlinks in existing parents of a not-yet-created path.
@@ -40,6 +41,73 @@ func contains(parent, path string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 func (r *Resolved) validate() error {
+	if err := injection.Validate(r.PromptInjection); err != nil {
+		return err
+	}
+	if r.Guardrails.RequirePromptInjection {
+		cfg := r.PromptInjection.Defaults()
+		if !cfg.Enabled || cfg.Action != "block" {
+			return fmt.Errorf("guardrails require blocking prompt injection detection")
+		}
+		for _, required := range []string{"prompt", "model_request", "mcp_result"} {
+			found := false
+			for _, source := range cfg.Sources {
+				if source == required {
+					found = true
+				}
+			}
+			if !found {
+				return fmt.Errorf("required prompt injection source missing: %s", required)
+			}
+		}
+	}
+	g := r.Guardrails
+	if g.MaxSessionSeconds < 0 || g.MaxSessionSeconds > 604800 || g.MaxOutputBytes < 0 {
+		return fmt.Errorf("invalid guardrail limits (session maximum is 7 days)")
+	}
+	if g.Strict {
+		if !r.PromptFilter.Enabled || r.PromptFilter.Mode == "monitor" {
+			return fmt.Errorf("strict guardrails require content filtering in enforce mode")
+		}
+		if !r.PromptFilter.ScanResponses {
+			return fmt.Errorf("strict guardrails require model response scanning")
+		}
+		if len(r.AllowDomains) > 0 {
+			return fmt.Errorf("strict guardrails prohibit raw egress; use inspected key_injection routes")
+		}
+		if g.AuditLog == "" || r.PromptFilter.AuditLog == "" {
+			return fmt.Errorf("strict guardrails require session and content audit logs")
+		}
+		if g.MaxSessionSeconds == 0 || g.MaxOutputBytes == 0 {
+			return fmt.Errorf("strict guardrails require positive session and output limits")
+		}
+		if r.Limits.MaxRequests == 0 || r.Limits.MaxRequestBytes == 0 {
+			return fmt.Errorf("strict guardrails require request and byte budgets")
+		}
+		for _, route := range r.KeyInject {
+			if !route.JSON.RequireJSON || len(route.Methods) == 0 || len(route.AllowPaths) == 0 {
+				return fmt.Errorf("strict guardrails require JSON, method and path restrictions on every route")
+			}
+		}
+	}
+	if g.AuditLog != "" {
+		audit, err := canonical(g.AuditLog)
+		if err != nil {
+			return err
+		}
+		for _, w := range r.Writable {
+			if contains(w, audit) {
+				return fmt.Errorf("guardrail audit must be outside writable paths")
+			}
+		}
+		if audit == r.PromptFilter.AuditLog {
+			return fmt.Errorf("guardrail and content audits must use separate files")
+		}
+		r.Guardrails.AuditLog = audit
+		r.ReadDeny = append(r.ReadDeny, audit)
+		r.SelfProtect = append(r.SelfProtect, audit)
+	}
+
 	if r.ProxyPort < 0 || r.ProxyPort > 65535 {
 		return fmt.Errorf("proxy_port must be between 0 and 65535")
 	}

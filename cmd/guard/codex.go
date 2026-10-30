@@ -14,6 +14,8 @@ import (
 
 	"guard/internal/credential"
 	"guard/internal/filter"
+	"guard/internal/guardrails"
+	"guard/internal/injection"
 	"guard/internal/mcpguard"
 	"guard/internal/policy"
 )
@@ -23,6 +25,8 @@ func initCmd(args []string) {
 	ws := fs.String("workspace", "", "directory Codex may modify")
 	output := fs.String("output", "guard.json", "new policy file (never overwritten)")
 	model := fs.String("model", "", "model ID available to your account")
+	injectionProvider := fs.String("injection-provider", "local", "оценщик: local или jev (TypeSafe API)")
+	injectionEndpoint := fs.String("injection-endpoint", "", "local semantic prompt-injection classifier endpoint")
 	exampleMCP := fs.String("mcp-example", "", "native example MCP executable (echo requires approval)")
 	authMode := fs.String("auth", "chatgpt", "chatgpt (existing Codex login) or api")
 	if err := fs.Parse(args); err != nil {
@@ -53,18 +57,33 @@ func initCmd(args []string) {
 	if err := os.MkdirAll(logs, 0700); err != nil {
 		die("%v", err)
 	}
+	piiRules := []filter.Rule{
+		{Name: "email", Pattern: `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`, Action: "redact"},
+		{Name: "phone", Pattern: `\+[0-9][0-9 ()-]{8,}[0-9]`, Action: "redact"},
+	}
 	p := policy.Policy{
 		Workspace:   abs,
+		Guardrails:  guardrails.Config{Strict: true, MaxSessionSeconds: 3600, MaxOutputBytes: 16 << 20, AuditLog: filepath.Join(logs, fmt.Sprintf("session-%d.guardrails.jsonl", time.Now().UnixNano()))},
 		ReadDeny:    []string{"~/.ssh", "~/.aws", "~/.config/gh", "~/.codex", "~/.claude", "~/.hermes", "~/.guard", "~/Library/Keychains"},
 		SelfProtect: []string{".git/hooks", ".git/config", ".envrc", ".codex", ".claude"},
 		EnvAllow:    []string{"PATH", "USER", "LOGNAME", "TERM", "COLORTERM", "LANG", "LC_ALL"},
 		Codex:       policy.Codex{Model: *model, Route: "/openai", Binary: "codex"},
 		KeyInject:   []policy.KeyInjection{{Prefix: "/openai", Upstream: "https://api.openai.com", Header: "Authorization", HeaderPrefix: "Bearer ", Env: "OPENAI_API_KEY", Methods: []string{"POST"}, AllowPaths: []string{"/v1/responses", "/v1/responses/compact"}, JSON: filter.JSONPolicy{RequireJSON: true}}},
-		PromptFilter: filter.Config{Enabled: true, Mode: "enforce", MaxBodyBytes: 4 << 20, AuditLog: filepath.Join(logs, fmt.Sprintf("session-%d.log", time.Now().UnixNano())), Redact: []filter.Rule{
-			{Name: "email", Pattern: `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`, Action: "redact"},
-			{Name: "phone", Pattern: `\+[0-9][0-9 ()-]{8,}[0-9]`, Action: "redact"},
-		}},
+		PromptFilter: filter.Config{
+			Enabled: true, Mode: "enforce", MaxBodyBytes: 4 << 20,
+			ScanResponses: true, ResponseRules: append([]filter.Rule(nil), piiRules...),
+			ResponseMaxBytes: 8 << 20, ResponseTimeoutSec: 120,
+			AuditLog: filepath.Join(logs, fmt.Sprintf("session-%d.log", time.Now().UnixNano())),
+			Redact:   piiRules,
+		},
 		Limits: policy.Limits{MaxRequests: 500, RatePerMin: 60, MaxRequestBytes: 50 << 20},
+	}
+	if *injectionEndpoint != "" || *injectionProvider != "local" {
+		p.PromptInjection = injection.Config{Enabled: true, Provider: *injectionProvider, AllowRemote: *injectionProvider == "jev", Endpoint: *injectionEndpoint, RuntimeDir: filepath.Join(home, ".guard", "injection")}.Defaults()
+		p.Guardrails.RequirePromptInjection = true
+		if err := injection.Validate(p.PromptInjection); err != nil {
+			die("%v", err)
+		}
 	}
 	if *authMode == "chatgpt" {
 		p.Codex.Route = "/codex"
@@ -102,6 +121,12 @@ func initCmd(args []string) {
 		die("%v", closeErr)
 	}
 	fmt.Printf("Created %s\nWorkspace: %s\nAudit log: %s\nRun: guard codex --policy %s\n", *output, abs, p.PromptFilter.AuditLog, *output)
+	if p.PromptInjection.Provider == "jev" {
+		fmt.Println("Jev: текст после локальных фильтров будет отправляться в TypeSafe API; ключ TYPESAFE_API_KEY остаётся у guard.")
+	}
+	if !p.PromptInjection.Enabled {
+		fmt.Println("Semantic prompt injection detection: OFF (enable with --injection-endpoint)")
+	}
 }
 
 func codexCmd(args []string) {
@@ -144,6 +169,27 @@ func prepareCodex(r *policy.Resolved, port int, args []string, gatewayToken stri
 	binary, err = filepath.EvalSymlinks(binary)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	binary, err = filepath.Abs(binary)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	for _, denied := range r.ExecDeny {
+		if denied == binary {
+			return nil, nil, nil, fmt.Errorf("Codex binary is denied by exec policy")
+		}
+	}
+	if len(r.ExecAllow) > 0 {
+		allowed := false
+		for _, path := range r.ExecAllow {
+			if path == binary {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return nil, nil, nil, fmt.Errorf("Codex binary is absent from exec.allow")
+		}
 	}
 	session, err := os.MkdirTemp("", "guard-codex-*")
 	if err != nil {
@@ -231,6 +277,9 @@ stream_max_retries = 0
 	}
 	r.Writable = append(r.Writable, session)
 	r.SelfProtect = append(r.SelfProtect, bin, configPath)
+	if len(r.ExecAllow) > 0 {
+		r.ExecAllow = append(r.ExecAllow, staged)
+	}
 	if realHome, e := os.UserHomeDir(); e == nil {
 		r.ReadDeny = append(r.ReadDeny, filepath.Join(realHome, ".codex"))
 	}

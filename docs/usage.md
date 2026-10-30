@@ -4,11 +4,11 @@
 
 **English** · [Русский](usage.ru.md) · [Overview](../README.md)
 
-`guard` is the CLI name for the Guard prototype. Its three commands are `profile`, `submit` and `run`. Run commands below from the repository root.
+`guard` is the CLI name for the Guard prototype. Commands include `profile`, `submit`, `run`, `init`, `check`, `codex` and `mcp`. Run commands below from the repository root.
 
 ## Build and inspect
 
-Requires Go 1.26+ as declared in [go.mod](../go.mod). macOS sandbox execution uses `/usr/bin/sandbox-exec`; Linux uses `bwrap` and remains experimental. Windows has no backend in this source tree.
+Requires Go 1.26+ as declared in [go.mod](../go.mod). macOS sandbox execution uses `/usr/bin/sandbox-exec`; Linux uses `bwrap`, mandatory seccomp and an inherited proxy transport; user namespaces must be available. Windows has no backend in this source tree.
 
 ```sh
 go build -o guard ./cmd/guard
@@ -99,7 +99,7 @@ Interactive TUIs can take input directly; that input does not automatically pass
 
 For an initial observation pass, change `prompt_filter.mode` to `"monitor"` in your local policy copy. Content filter rules then log would-be block/redact actions without altering the payload. This does **not** disable sandbox restrictions, route method/path/query policy or request limits.
 
-`max_body_bytes` caps inspected request body size; `scan_responses` enables rules for eligible non-streaming responses. SSE responses bypass scanning. Content filtering applies to configured reverse-proxy routes, not to arbitrary HTTP forwarding or encrypted `CONNECT` payloads. URL query inspection includes percent-decoding for matching, but redaction should not be treated as a complete encoded-data scrubber.
+`max_body_bytes` caps inspected request body size; `scan_responses` enables rules for eligible non-streaming responses. With `scan_responses`, supported SSE responses are buffered and checked before delivery. Content filtering applies to configured reverse-proxy routes, not to arbitrary HTTP forwarding or encrypted `CONNECT` payloads. URL query inspection includes percent-decoding for matching, but redaction should not be treated as a complete encoded-data scrubber.
 
 ## Policy reference
 
@@ -128,7 +128,7 @@ For an initial observation pass, change `prompt_filter.mode` to `"monitor"` in y
 }
 ```
 
-macOS emits literal-path execution rules. A non-empty `allow` list selects allowlist mode and needs tuning for interpreter/helper processes. Denylists do not cover a copied binary at another path. Linux currently does not implement these per-binary rules.
+macOS emits literal-path execution rules. A non-empty `allow` list selects allowlist mode and needs tuning for interpreter/helper processes. Denylists do not cover a copied binary at another path. Linux hides denied binaries and implements `exec.allow` with Landlock. Allow dynamic loaders/interpreters explicitly when needed.
 
 ### Session limits
 
@@ -167,14 +167,31 @@ Use a disposable macOS test environment with Go, `curl`, Python 3 and `lsof`. Re
 | Area | Current behavior |
 | --- | --- |
 | macOS | Seatbelt via `sandbox-exec`; availability and behavior must be checked on the target OS. The interface is deprecated. |
-| Linux | bubblewrap namespace/mount setup exists, but there is no bridge from the isolated network namespace to the proxy on the parent loopback. HOME masking can also cover a workspace located beneath HOME. End-to-end harness connectivity needs further work. |
+| Linux | bubblewrap user/PID/network/mount namespaces, inherited proxy transport and mandatory seccomp; amd64/arm64. `exec.allow` requires Landlock. HOME workspaces are preserved. |
 | Windows / Docker | No Windows backend or `--docker` execution mode is implemented. |
 | Filesystem | Broad reads except `read_deny`; workspace plus configured writable paths and backend temporary/device exceptions for writes. Not a minimal filesystem view. |
 | Local network | macOS permits localhost connections generally, including other local services. The profile does not restrict access to only the proxy listener. |
 | HTTPS | CONNECT enforces destination host policy, not encrypted paths, bodies or headers. |
-| Content rules | Regex-based; no complete prompt-injection, encoded-secret or semantic DLP guarantee. Streaming SSE responses are not scanned. |
+| Content rules | Regex-based; no complete prompt-injection, encoded-secret or semantic DLP guarantee. Supported SSE responses are gated when `scan_responses` is enabled. |
 | API policy | Path-prefix matching; no operation-level business authorization or human approval service. |
 | Credentials | Proxy injection reduces child-environment exposure; it does not stop use of an allowed authenticated operation. Policy must exclude other credential sources. |
 | Audit and usage | Filter decision log plus process logs; approximate request/body counters. No immutable evidence store or spend accounting. |
 
 This is a prototype for evaluation. [Report vulnerabilities privately](../SECURITY.md), and [discuss enterprise requirements](enterprise.md) when you need a broader deployment scope.
+
+## Session guardrails
+
+New policies generated by `guard init` enable `guardrails.strict`, a one-hour
+session timeout and a shared 16 MiB stdout/stderr budget. Existing policies can
+opt in using `guardrails.max_session_seconds`, `guardrails.max_output_bytes` and
+`guardrails.audit_log` (a private file outside writable paths). Strict mode also
+requires enforced content filtering, content/session audit, request and byte
+budgets, JSON routes with explicit methods/paths, and no raw egress domains,
+including local MCP egress. MCP calls pass through the managed gateway.
+
+A violation terminates the process group and records its reason without recording
+raw output. Linux's PID namespace closes the sandbox lifecycle; detached process
+sessions on macOS need a VM for stronger lifecycle enforcement. Interactive
+sessions retain a terminal through a PTY. Model JSON and supported SSE responses support block/redact/flag rules, JSON
+pointers and final-response schema checks. SSE is buffered before delivery, so
+token-by-token output is delayed. This is not a semantic answer classifier. See the [full runtime guide](runtime.ru.md).

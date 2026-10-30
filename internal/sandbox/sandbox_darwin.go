@@ -106,6 +106,13 @@ func Profile(r *policy.Resolved) (string, error) {
 	}
 	w(`(allow file-write-data (literal "/dev/null") (literal "/dev/dtracehelper"))`)
 	w(`(allow file-ioctl (literal "/dev/null") (literal "/dev/tty"))`)
+	if r.TerminalDevice != "" {
+		device, err := sbStr(r.TerminalDevice)
+		if err != nil {
+			return "", err
+		}
+		w("(allow file-ioctl (literal %s))", device)
+	}
 	w(`(allow file-write* file-read* (regex #"^/dev/(tty|ptmx|null|zero|random|urandom)"))`)
 	w("")
 

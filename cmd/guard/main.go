@@ -21,8 +21,11 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"guard/internal/filter"
+	"guard/internal/guardrails"
+	"guard/internal/injection"
 	"guard/internal/mcpguard"
 	"guard/internal/policy"
 	"guard/internal/proxy"
@@ -34,6 +37,8 @@ func main() {
 		usage()
 	}
 	switch os.Args[1] {
+	case "evaluate":
+		evaluateCmd(os.Args[2:])
 	case "mcp":
 		mcpCmd(os.Args[2:])
 	case "check":
@@ -57,10 +62,11 @@ func usage() {
 	fmt.Fprint(os.Stderr, `guard — sandbox any agent harness
 
 usage:
+  guard evaluate --policy FILE
   guard mcp pending|approve|deny --policy FILE [--id ID]
   guard mcp bridge --server NAME  (inside guard run; uses GUARD_MCP_CONFIG)
   guard check   --policy FILE         validate policy and backend
-  guard init    --workspace DIR [--output guard.json] [--auth chatgpt|api] [--model MODEL]
+  guard init    --workspace DIR [--output guard.json] [--auth chatgpt|api] [--model MODEL] [--injection-endpoint URL] [--injection-provider local|jev]
   guard codex   --policy FILE [--dry-run] -- [CODEX ARGS...]
   guard run     --policy FILE [--dry-run] -- HARNESS [ARGS...]
   guard submit  --policy FILE [--prompt TEXT] [-- HARNESS ARGS...]
@@ -146,7 +152,35 @@ func submitCmd(args []string) {
 		die("filter: %v", err)
 	}
 	defer f.Close()
+	if r.PromptInjection.Enabled {
+		f.ProtectSecret(os.Getenv(r.PromptInjection.Defaults().TokenEnv))
+	}
 	cleaned, d := f.Request(prompt)
+	if d.Action != filter.Block {
+		detector, e := injection.New(r.PromptInjection)
+		if e != nil {
+			die("%v", e)
+		}
+		defer detector.Close()
+		verdict := detector.Scan(context.Background(), "prompt", cleaned)
+		if verdict.Model != "" {
+			decision := filter.Decision{Action: filter.Allow, Rule: verdict.Rule}
+			if verdict.Block {
+				decision.Action = filter.Block
+			}
+			if verdict.Flag {
+				decision.Flagged = []string{verdict.Rule}
+			}
+			f.RecordDetail("prompt-injection:prompt", decision, fmt.Sprintf("model=%s score=%.6f sha256=%s", verdict.Model, verdict.Score, verdict.Hash))
+		}
+		if verdict.Block {
+			d = filter.Decision{Action: filter.Block, Rule: verdict.Rule}
+		}
+		if verdict.Flag {
+			d.Flagged = append(d.Flagged, verdict.Rule)
+		}
+	}
+
 	if err := f.AuditError(); err != nil {
 		die("audit write failed: %v", err)
 	}
@@ -222,7 +256,7 @@ func finishLaunch(err error) {
 	}
 	die("%v", err)
 }
-func runLaunch(r *policy.Resolved, dryRun bool, argv []string, stdin io.Reader, codex bool) error {
+func runLaunch(r *policy.Resolved, dryRun bool, argv []string, stdin io.Reader, codex bool) (resultErr error) {
 	logger := log.New(os.Stderr, "\x1b[2m[guard]\x1b[0m ", 0)
 
 	// 1. Start the egress proxy in the trusted parent (secrets live here only).
@@ -264,6 +298,7 @@ func runLaunch(r *policy.Resolved, dryRun bool, argv []string, stdin io.Reader, 
 	}
 	r.Writable = append(r.Writable, scratch)
 	extraEnv := []string{"TMPDIR=" + scratch}
+	r.MCP.Injection = r.PromptInjection
 	var gatewayToken string
 	{
 		if len(r.MCP.Servers) > 0 {
@@ -333,14 +368,39 @@ func runLaunch(r *policy.Resolved, dryRun bool, argv []string, stdin io.Reader, 
 		return nil
 	}
 
-	// 4. Launch the harness under the sandbox.
-	cmd := buildCommand(r, profPath, env, argv)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, os.Stdout, os.Stderr
+	// 4. Launch with harness-independent session guardrails.
+	session, err := guardrails.New(r.Guardrails)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if e := session.Close(); e != nil && resultErr == nil {
+			resultErr = e
+		}
+	}()
+
+	cmd, commandCleanup, err := buildCommand(r, profPath, env, argv)
+	if err != nil {
+		return err
+	}
+	defer commandCleanup()
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = 2 * time.Second
 
 	cmd.Dir = r.Workspace
-	if err := cmd.Start(); err != nil {
+	terminalCleanup, err := startHarness(cmd, stdin, session, func(device string) error {
+		r.TerminalDevice = device
+		profile, err := sandbox.Profile(r)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(profPath, []byte(profile), 0600)
+	})
+	if err != nil {
 		return fmt.Errorf("start harness: %w", err)
 	}
+	defer terminalCleanup()
+	session.Start()
 	sig := make(chan os.Signal, 1)
 	done := make(chan struct{})
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -349,14 +409,34 @@ func runLaunch(r *policy.Resolved, dryRun bool, argv []string, stdin io.Reader, 
 	go func() {
 		for {
 			select {
+			case <-session.Violated():
+				// A shell can be in fork while the first group signal is delivered.
+				// Keep terminating the group until Wait drains inherited output pipes.
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				_ = cmd.Process.Kill()
+				ticker := time.NewTicker(10 * time.Millisecond)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-done:
+						return
+					case <-ticker.C:
+						_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+					}
+				}
+
 			case s := <-sig:
-				_ = cmd.Process.Signal(s)
+				_ = syscall.Kill(-cmd.Process.Pid, s.(syscall.Signal))
 			case <-done:
 				return
 			}
 		}
 	}()
 	err = cmd.Wait()
+	terminalCleanup()
+	if guardErr := session.Err(); guardErr != nil {
+		return guardErr
+	}
 	logger.Printf("egress denials: %d · prompt-filter actions: %d · throttled: %d", px.DenyCount(), px.FilterCount(), px.LimitCount())
 	return err
 }
